@@ -11,6 +11,7 @@ class AutoTrader:
         self.api = Unitrade()
         self.actno: str = ""
         self._running = False
+        self.strategy = None  # 由外部注入 MTXStrategy
 
     # ── 啟動 / 停止 ──────────────────────────────────────────────
 
@@ -64,7 +65,8 @@ class AutoTrader:
 
     def _on_tick(self, tick):
         logger.debug(f"Tick | {tick.commodityid} price={tick.matchprice} qty={tick.matchquantity} total={tick.matchtotalqty}")
-        self._strategy(tick)
+        if self.strategy:
+            self.strategy.on_tick(tick.matchprice)
 
     def _on_reply(self, reply):
         logger.info(f"Reply | {reply.productid} {reply.bs} status={reply.orderstatus} orderno={reply.orderno}")
@@ -75,18 +77,13 @@ class AutoTrader:
     def _on_error(self, error):
         logger.error(f"API error: {error}")
 
-    # ── 策略骨架（覆寫此方法來實作信號邏輯）─────────────────────
-
-    def _strategy(self, tick):
-        pass  # TODO: 實作你的交易信號邏輯
-
     # ── 下單工具 ──────────────────────────────────────────────────
 
-    def buy(self, productid: str, qty: int, ordertype: str = "M", price: float = 0):
-        return self._send_order(productid, "B", qty, ordertype, price)
+    def buy(self, productid: str, qty: int, ordertype: str = "M", price: float = 0, opencloseflag: str = ""):
+        return self._send_order(productid, "B", qty, ordertype, price, opencloseflag)
 
-    def sell(self, productid: str, qty: int, ordertype: str = "M", price: float = 0):
-        return self._send_order(productid, "S", qty, ordertype, price)
+    def sell(self, productid: str, qty: int, ordertype: str = "M", price: float = 0, opencloseflag: str = ""):
+        return self._send_order(productid, "S", qty, ordertype, price, opencloseflag)
 
     def cancel(self, orderno: str):
         obj = DReplaceObject()
@@ -98,7 +95,7 @@ class AutoTrader:
             logger.error(f"Cancel failed: {resp.errormsg}")
         return resp
 
-    def _send_order(self, productid: str, bs: str, qty: int, ordertype: str, price: float):
+    def _send_order(self, productid: str, bs: str, qty: int, ordertype: str, price: float, opencloseflag: str = ""):
         order = DOrderObject()
         order.actno = self.actno
         order.productid = productid
@@ -107,7 +104,7 @@ class AutoTrader:
         order.price = price
         order.orderqty = qty
         order.ordercondition = "R"   # R:ROD I:IOC F:FOK
-        order.opencloseflag = ""     # 空白=自動
+        order.opencloseflag = opencloseflag  # "":自動 "0":新倉 "1":平倉
         order.dtrade = "N"
         resp = self.api.dtrade.order(order)
         if not resp.issend:
