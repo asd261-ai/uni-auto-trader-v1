@@ -4,10 +4,15 @@ import logging
 from typing import Optional
 import requests
 
+import telegram_notify as tg
+
 logger = logging.getLogger(__name__)
 
 HISTORY_URL = "https://mtx-monitor.asd261-af5.workers.dev/api/history"
 POLL_INTERVAL = 15  # seconds
+
+ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
+EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄"}
 
 
 class MTXStrategy:
@@ -21,6 +26,8 @@ class MTXStrategy:
     def __init__(self, trader, dry_run: bool = True):
         self.trader = trader
         self.dry_run = dry_run
+        self._tg_token = trader.config.get("telegram_token", "")
+        self._tg_chat = trader.config.get("telegram_chat_id", "")
 
         # Position state (protected by lock)
         self._lock = threading.Lock()
@@ -127,6 +134,16 @@ class MTXStrategy:
             self._trade_id = trade["id"]
             logger.info(f"Position opened | {self._position} entry={entry} stop={stop} target={target}")
 
+            label = trade.get("sigLabel", "")
+            emoji = ENTRY_EMOJI.get(self._position, "📌")
+            dry_tag = " [DRY RUN]" if self.dry_run else ""
+            self._notify(
+                f"{emoji} <b>進場{dry_tag}</b>\n"
+                f"信號：{label}\n"
+                f"方向：{'多' if self._position == 'long' else '空'}\n"
+                f"進場：{entry}　停損：{stop}　停利：{target}"
+            )
+
     def _check_exit(self, price: float):
         if self._position == "long":
             if self._stop and price <= self._stop:
@@ -146,12 +163,26 @@ class MTXStrategy:
 
     def _close(self, reason: str):
         product = self.trader.config["product"]
-        if self._position == "long":
+        prev_position = self._position
+        prev_entry = self._entry_price
+
+        if prev_position == "long":
             self._execute_order("SELL", product, 1, opencloseflag="1")
-        elif self._position == "short":
+        elif prev_position == "short":
             self._execute_order("BUY", product, 1, opencloseflag="1")
 
-        logger.info(f"Position closed | reason={reason} | was={self._position} entry={self._entry_price}")
+        logger.info(f"Position closed | reason={reason} | was={prev_position} entry={prev_entry}")
+
+        emoji = EXIT_EMOJI.get(reason, "⏹")
+        reason_zh = {"profit": "停利出場", "loss": "停損出場", "reversed": "反向平倉"}.get(reason, reason)
+        dry_tag = " [DRY RUN]" if self.dry_run else ""
+        self._notify(
+            f"{emoji} <b>出場{dry_tag}</b>\n"
+            f"原因：{reason_zh}\n"
+            f"方向：{'多' if prev_position == 'long' else '空'}\n"
+            f"進場：{prev_entry}"
+        )
+
         self._position = None
         self._entry_price = None
         self._stop = None
@@ -172,6 +203,11 @@ class MTXStrategy:
 
         if not resp.issend:
             logger.error(f"Order failed | {side} {product}: {resp.errormsg}")
+
+    # ── 通知 ─────────────────────────────────────────────────────
+
+    def _notify(self, text: str):
+        tg.send(self._tg_token, self._tg_chat, text)
 
     # ── HTTP helpers ──────────────────────────────────────────────
 

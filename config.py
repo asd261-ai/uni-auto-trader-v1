@@ -10,4 +10,6 @@ CONFIG = {
     "ca_path": os.getenv("UNITRADE_CA_PATH", ""),
     "ca_password": os.getenv("UNITRADE_CA_PASSWORD", ""),
     "product": os.getenv("UNITRADE_PRODUCT", "MXFG5"),
+    "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
 }
