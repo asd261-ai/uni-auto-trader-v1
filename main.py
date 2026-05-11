@@ -1,12 +1,29 @@
-import os
-from dotenv import load_dotenv
+import signal
+import time
+import logging
 
-load_dotenv()
+from config import CONFIG
+from trader import AutoTrader
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+trader = AutoTrader(CONFIG)
 
 
-def main():
-    print("Uni Auto Trader V1 loaded")
+def _shutdown(sig, frame):
+    print("\nShutting down...")
+    trader.stop()
+    exit(0)
 
 
-if __name__ == "__main__":
-    main()
+signal.signal(signal.SIGINT, _shutdown)
+signal.signal(signal.SIGTERM, _shutdown)
+
+trader.start()
+
+while True:
+    time.sleep(1)

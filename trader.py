@@ -1,0 +1,116 @@
+import time
+import logging
+from unitrade import Unitrade
+from unitrade.dtrade_data import DOrderObject, DReplaceObject
+
+logger = logging.getLogger(__name__)
+
+
+class AutoTrader:
+    def __init__(self, config: dict):
+        self.config = config
+        self.api = Unitrade()
+        self.actno: str = ""
+        self._running = False
+
+    # ── 啟動 / 停止 ──────────────────────────────────────────────
+
+    def start(self):
+        self._login()
+        self._register_callbacks()
+        self._subscribe()
+        self._running = True
+        logger.info(f"AutoTrader started | product={self.config['product']} | account={self.actno}")
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        self.api.dquote.unsubscribe_trade_bid_offer(self.config["product"])
+        self.api.logout()
+        logger.info("AutoTrader stopped")
+
+    # ── 初始化步驟 ────────────────────────────────────────────────
+
+    def _login(self):
+        resp = self.api.login(
+            self.config["url"],
+            self.config["userid"],
+            self.config["password"],
+            self.config["ca_path"],
+            self.config["ca_password"],
+        )
+        if not resp.ok:
+            raise RuntimeError(f"Login failed: {resp.error}")
+
+        accounts = self.api.get_accounts()
+        if not accounts:
+            raise RuntimeError("No accounts found after login")
+        self.actno = accounts[0]
+        logger.info(f"Logged in | account={self.actno}")
+
+    def _register_callbacks(self):
+        self.api.dquote.on_tick_data_trade = self._on_tick
+        self.api.dtrade.on_reply = self._on_reply
+        self.api.dtrade.on_match = self._on_match
+        self.api.on_error = self._on_error
+
+    def _subscribe(self):
+        ok, err = self.api.dquote.subscribe_trade_bid_offer(self.config["product"])
+        if not ok:
+            raise RuntimeError(f"Subscribe failed: {err}")
+        logger.info(f"Subscribed to {self.config['product']}")
+
+    # ── 事件回調 ──────────────────────────────────────────────────
+
+    def _on_tick(self, tick):
+        logger.debug(f"Tick | {tick.commodityid} price={tick.matchprice} qty={tick.matchquantity} total={tick.matchtotalqty}")
+        self._strategy(tick)
+
+    def _on_reply(self, reply):
+        logger.info(f"Reply | {reply.productid} {reply.bs} status={reply.orderstatus} orderno={reply.orderno}")
+
+    def _on_match(self, match):
+        logger.info(f"Match | {match.productid} {match.bs} price={match.matchprice} qty={match.matchqty} orderno={match.orderno}")
+
+    def _on_error(self, error):
+        logger.error(f"API error: {error}")
+
+    # ── 策略骨架（覆寫此方法來實作信號邏輯）─────────────────────
+
+    def _strategy(self, tick):
+        pass  # TODO: 實作你的交易信號邏輯
+
+    # ── 下單工具 ──────────────────────────────────────────────────
+
+    def buy(self, productid: str, qty: int, ordertype: str = "M", price: float = 0):
+        return self._send_order(productid, "B", qty, ordertype, price)
+
+    def sell(self, productid: str, qty: int, ordertype: str = "M", price: float = 0):
+        return self._send_order(productid, "S", qty, ordertype, price)
+
+    def cancel(self, orderno: str):
+        obj = DReplaceObject()
+        obj.replacetype = "4"
+        obj.actno = self.actno
+        obj.orderno = orderno
+        resp = self.api.dtrade.replace_order(obj)
+        if not resp.issend:
+            logger.error(f"Cancel failed: {resp.errormsg}")
+        return resp
+
+    def _send_order(self, productid: str, bs: str, qty: int, ordertype: str, price: float):
+        order = DOrderObject()
+        order.actno = self.actno
+        order.productid = productid
+        order.bs = bs
+        order.ordertype = ordertype  # L:限價 M:市價 P:範圍市價
+        order.price = price
+        order.orderqty = qty
+        order.ordercondition = "R"   # R:ROD I:IOC F:FOK
+        order.opencloseflag = ""     # 空白=自動
+        order.dtrade = "N"
+        resp = self.api.dtrade.order(order)
+        if not resp.issend:
+            logger.error(f"Order failed: {resp.errormsg}")
+        return resp
