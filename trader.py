@@ -1,7 +1,6 @@
 import time
 import logging
-from unitrade import Unitrade
-from unitrade.dtrade_data import DOrderObject, DReplaceObject
+from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 
 logger = logging.getLogger(__name__)
 
