@@ -118,6 +118,12 @@ class MTXStrategy:
             elif self._position == "short" and direction == "long":
                 self._close("reversed")
 
+            # Skip same-direction signals — max 1 contract at a time
+            if (self._position == "long" and direction == "long") or \
+               (self._position == "short" and direction == "short"):
+                logger.info(f"Skipping same-direction signal (already {self._position}) | label={trade.get('sigLabel')}")
+                return
+
             if direction == "long":
                 self._execute_order("BUY", product, 1)
                 self._position = "long"
