@@ -32,6 +32,7 @@ class MTXStrategy:
     Polls MTX-1 Monitor /api/history and executes trades via AutoTrader.
     - Detects new 'open' trades from the Monitor
     - Enters position via Unitrade API
+    - Syncs Worker-driven exits (OB-3, stop hit) and trailing stop updates
     - Monitors stop/target on each tick for fast exit
     - Sends Telegram notifications with P&L on every exit
     - Sends session summary at end of day/night session
@@ -66,10 +67,10 @@ class MTXStrategy:
 
     def start(self):
         try:
-            latest = self._fetch_latest_trade()
-            if latest:
-                self._last_seen_id = latest["id"]
-                logger.info(f"Startup: latest trade id={latest['id']} status={latest.get('status')} — skipping")
+            history = self._fetch_history()
+            if history:
+                self._last_seen_id = history[0]["id"]
+                logger.info(f"Startup: latest trade id={history[0]['id']} status={history[0].get('status')} — skipping")
         except Exception as e:
             logger.warning(f"Startup fetch failed: {e}")
 
@@ -99,7 +100,9 @@ class MTXStrategy:
         while self._running:
             try:
                 self._check_session_change()
-                self._check_new_signal()
+                history = self._fetch_history()
+                self._check_new_signal(history)
+                self._sync_worker_state(history)
             except Exception as e:
                 logger.error(f"Poll error: {e}")
             time.sleep(POLL_INTERVAL)
@@ -121,11 +124,11 @@ class MTXStrategy:
             label = "日盤" if session == "day" else "夜盤"
             logger.info(f"{label}開始")
 
-    def _check_new_signal(self):
-        trade = self._fetch_latest_trade()
-        if not trade:
+    def _check_new_signal(self, history: list):
+        if not history:
             return
 
+        trade    = history[0]
         trade_id = trade["id"]
         status   = trade.get("status", "")
 
@@ -140,6 +143,54 @@ class MTXStrategy:
                     f"label={trade.get('sigLabel')}")
         self._last_seen_id = trade_id
         self._enter(trade)
+
+    # ── Worker 狀態同步：OB-3 出場 + 移動停損更新 ─────────────────
+
+    def _sync_worker_state(self, history: list):
+        """
+        Sync two things from Worker history:
+        1. Worker-driven exits: OB-3, stop/target hit recorded by Worker
+           → if our open trade is no longer 'open'/'trail', close locally
+        2. Trailing stop updates: Worker moved stop up/down to lock profit
+           → update self._stop so tick-level _check_exit uses latest value
+        """
+        with self._lock:
+            if self._position is None or self._trade_id is None:
+                return
+            trade_id = self._trade_id
+
+        # Find our trade in history (search up to 20 recent entries)
+        our_trade = next((t for t in history[:20] if t["id"] == trade_id), None)
+        if our_trade is None:
+            return
+
+        status   = our_trade.get("status", "open")
+        new_stop = our_trade.get("stop")
+
+        with self._lock:
+            if self._position is None:
+                return  # closed by tick between the two lock acquisitions
+
+            if status == "loss":
+                # Worker closed via OB-3, ATR stop, or other loss rule
+                # Approximate exit price: entry + pnl (long) or entry - pnl (short)
+                pnl = our_trade.get("pnl") or 0
+                exit_price = (our_trade["entry"] + pnl) if self._position == "long" \
+                             else (our_trade["entry"] - pnl)
+                logger.info(f"Worker exit (loss) | id={trade_id} exit≈{exit_price}")
+                self._close("loss", exit_price=exit_price)
+
+            elif status == "profit":
+                exit_price = our_trade.get("target")
+                logger.info(f"Worker exit (profit) | id={trade_id} exit={exit_price}")
+                self._close("profit", exit_price=exit_price)
+
+            elif status in ("open", "trail") and new_stop and new_stop != self._stop:
+                # Trailing stop moved in Worker — keep in sync
+                logger.info(f"Trailing stop synced | {self._stop} → {new_stop} | id={trade_id}")
+                self._stop = new_stop
+
+            # 'reversed' is handled naturally by _check_new_signal when the new trade appears
 
     # ── 進場 ─────────────────────────────────────────────────────
 
@@ -187,7 +238,7 @@ class MTXStrategy:
                 f"進場：{entry}　停損：{stop}　停利：{target}"
             )
 
-    # ── 出場條件檢查 ──────────────────────────────────────────────
+    # ── 出場條件檢查（tick-level，毫秒級）────────────────────────
 
     def _check_exit(self, price: float):
         if self._position == "long":
@@ -310,8 +361,7 @@ class MTXStrategy:
 
     # ── HTTP helpers ──────────────────────────────────────────────
 
-    def _fetch_latest_trade(self) -> Optional[dict]:
+    def _fetch_history(self) -> list:
         resp = requests.get(HISTORY_URL, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-        return data[0] if data else None
+        return resp.json() or []
