@@ -138,7 +138,14 @@ class MTXStrategy:
             self._last_seen_id = trade_id
             return
 
-        logger.info(f"New open trade | id={trade_id} dir={trade.get('dir')} "
+        direction = trade.get("dir")
+        with self._lock:
+            if self._position == direction:
+                logger.info(f"Same-direction skip | already {self._position} | id={trade_id} label={trade.get('sigLabel')}")
+                self._last_seen_id = trade_id
+                return
+
+        logger.info(f"New open trade | id={trade_id} dir={direction} "
                     f"entry={trade.get('entry')} stop={trade.get('stop')} target={trade.get('target')} "
                     f"label={trade.get('sigLabel')}")
         self._last_seen_id = trade_id
@@ -290,26 +297,30 @@ class MTXStrategy:
             "reason":    reason,
         })
 
-        # Telegram 出場通知
-        emoji      = EXIT_EMOJI.get(reason, "⏹")
-        reason_zh  = {"profit": "停利出場", "loss": "停損出場", "reversed": "反向平倉"}.get(reason, reason)
-        dry_tag    = " [模擬]" if self.dry_run else ""
-        pnl_sign   = "+" if pnl_pts >= 0 else ""
-        pnl_line   = f"損益：<b>{pnl_sign}{pnl_pts:.0f} pts（{pnl_sign}NT${pnl_ntd:,}）</b>" if exit_price else ""
-        self._notify(
-            f"{emoji} <b>出場{dry_tag}</b>\n"
-            f"原因：{reason_zh}\n"
-            f"方向：{'多' if prev_position == 'long' else '空'}\n"
-            f"進場：{prev_entry}　出場：{exit_price}\n"
-            + pnl_line
-        )
-
+        # 立即清倉位狀態，確保後續 _enter() same-direction 判斷正確
         self._position    = None
         self._entry_price = None
         self._stop        = None
         self._target      = None
         self._trade_id    = None
         self._sig_label   = ""
+
+        # Telegram 出場通知（用 try/except 確保 Telegram 失敗不影響倉位追蹤）
+        emoji      = EXIT_EMOJI.get(reason, "⏹")
+        reason_zh  = {"profit": "停利出場", "loss": "停損出場", "reversed": "反向平倉"}.get(reason, reason)
+        dry_tag    = " [模擬]" if self.dry_run else ""
+        pnl_sign   = "+" if pnl_pts >= 0 else ""
+        pnl_line   = f"損益：<b>{pnl_sign}{pnl_pts:.0f} pts（{pnl_sign}NT${pnl_ntd:,}）</b>" if exit_price else ""
+        try:
+            self._notify(
+                f"{emoji} <b>出場{dry_tag}</b>\n"
+                f"原因：{reason_zh}\n"
+                f"方向：{'多' if prev_position == 'long' else '空'}\n"
+                f"進場：{prev_entry}　出場：{exit_price}\n"
+                + pnl_line
+            )
+        except Exception as e:
+            logger.warning(f"Exit notify failed: {e}")
 
     # ── Session 總結 ──────────────────────────────────────────────
 
