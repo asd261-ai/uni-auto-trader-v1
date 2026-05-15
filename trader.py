@@ -62,7 +62,12 @@ class AutoTrader:
     def _subscribe(self):
         ok, err = self.api.dquote.subscribe_trade_bid_offer(self.config["product"])
         if not ok:
-            raise RuntimeError(f"Subscribe failed: {err}")
+            # Bug 2 (regression-resistant): dquote subscribe occasionally fails with
+            # [Errno 11]. Strategy can still run via Worker-pull sync; tick feed is
+            # optional. Do NOT raise — that leaves a zombie process (C extension keeps
+            # PID alive while strategy.start() never runs).
+            logger.warning(f"dquote subscribe failed (continuing without tick feed): {err}")
+            return
         logger.info(f"Subscribed to {self.config['product']}")
 
     # ── 事件回調 ──────────────────────────────────────────────────
