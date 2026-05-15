@@ -30,7 +30,9 @@ def _init_config() -> None:
     global _URL, _SECRET
     if _URL is None:
         _URL    = os.getenv("TRADE_LOG_URL", "https://mtx-monitor.asd261-af5.workers.dev/api/trade_log")
-        _SECRET = os.getenv("BOT_AUTH_SECRET", "")
+        # Trader VPS .env historically had only HEARTBEAT_SECRET. Worker verifyBotHmac
+        # accepts either env (BOT_AUTH_SECRET preferred). Fallback for transition.
+        _SECRET = os.getenv("BOT_AUTH_SECRET") or os.getenv("HEARTBEAT_SECRET", "")
 
 
 def send(record: dict) -> None:
