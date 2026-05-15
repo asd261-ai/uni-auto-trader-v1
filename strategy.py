@@ -19,8 +19,22 @@ FVG_SIGNALS_URL  = "https://mtx-monitor.asd261-af5.workers.dev/api/signals?sourc
 FVG_OBSERVE_MODE = os.getenv("FVG_MODE", "shadow")
 POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
-MAX_UNITS     = 2     # match Worker MAX_UNITS
+MAX_UNITS     = 2     # match Worker MAX_UNITS — kept for MTX backwards-compat, will be removed in Phase 6b
 PYRAMID_LOCK  = 15    # pts — first unit stop locked to entry ± this on pyramid
+
+# ── Daily MAX LOSS lock (Phase 7 minimum) ──────────────────────────
+# When today's cumulative P&L (across all sources, across day+night sessions)
+# drops below this threshold, trader refuses new ENTRY/PYRAMID signals.
+# Existing open positions continue to close naturally (SL/TP/reversed).
+# Resets at trading-day boundary (08:45 TW, day session open).
+# Set via .env DAILY_MAX_LOSS_PTS=-300 (must be negative). Empty/unset → disabled.
+_dml_env = os.getenv("DAILY_MAX_LOSS_PTS", "").strip()
+try:
+    DAILY_MAX_LOSS_PTS: Optional[float] = float(_dml_env) if _dml_env else None
+    if DAILY_MAX_LOSS_PTS is not None and DAILY_MAX_LOSS_PTS >= 0:
+        DAILY_MAX_LOSS_PTS = None  # non-negative is nonsensical; treat as disabled
+except ValueError:
+    DAILY_MAX_LOSS_PTS = None
 
 TZ_TW = timezone(timedelta(hours=8))
 
@@ -75,6 +89,13 @@ class MTXStrategy:
         # Phase 6a-lite: FVG shadow observation (fetch + log, no trade)
         self._fvg_last_status: Dict[int, str] = {}  # signal_id → last-seen status
         self._fvg_primed:       bool          = False  # True after first poll absorbs initial state silently
+
+        # Phase 7: daily MAX LOSS lock state. Counter accumulates across day+night
+        # of the same trading day, resets at 08:45 TW (day session open).
+        self._trading_day_pnl_pts: float           = 0.0
+        self._trading_day_date:    Optional[Any]   = None  # `date` object, None until first poll
+        self._trading_day_locked:  bool            = False
+        self._trading_day_alert_sent: bool         = False  # one-shot Telegram on lock trigger
 
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
@@ -190,6 +211,7 @@ class MTXStrategy:
         while self._running:
             try:
                 self._check_session_change()
+                self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
                 history = self._fetch_history()
                 self._sync_worker_state(history)  # ① sync exits first — clears closed positions
                 self._check_new_signal(history)   # ② then pick up new signals with fresh state
@@ -204,11 +226,13 @@ class MTXStrategy:
             # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
             # errors (watchdog needs to see "process alive but polls failing" as a signal).
             heartbeat.send({
-                "ts":           int(time.time() * 1000),
-                "pid":          os.getpid(),
-                "session":      self._current_session,
-                "units":        len(self._units),
-                "last_seen_id": self._last_seen_id,
+                "ts":                  int(time.time() * 1000),
+                "pid":                 os.getpid(),
+                "session":             self._current_session,
+                "units":               len(self._units),
+                "last_seen_id":        self._last_seen_id,
+                "trading_day_pnl_pts": self._trading_day_pnl_pts,
+                "trading_day_locked":  self._trading_day_locked,
             })
             time.sleep(POLL_INTERVAL)
 
@@ -224,6 +248,37 @@ class MTXStrategy:
         if session in ("day", "night"):
             logger.info(f"{'日盤' if session == 'day' else '夜盤'}開始")
             threading.Thread(target=self._send_open_notify, args=(session,), daemon=True).start()
+
+    def _check_trading_day_reset(self):
+        """Reset daily P&L counter when trading day flips (08:45 TW).
+
+        Trading day boundary: 08:45 TW (day session open). Before that, today's
+        time belongs to yesterday's trading day. So overnight break (05:00–08:44)
+        is "still yesterday's trading day" from a P&L lock perspective.
+        """
+        now   = datetime.now(TZ_TW)
+        today = (now - timedelta(days=1)).date() if now.time() < dtime(8, 45) else now.date()
+        if self._trading_day_date is None:
+            self._trading_day_date = today
+            return
+        if today == self._trading_day_date:
+            return
+        prev_pnl     = self._trading_day_pnl_pts
+        was_locked   = self._trading_day_locked
+        self._trading_day_date        = today
+        self._trading_day_pnl_pts     = 0.0
+        self._trading_day_locked      = False
+        self._trading_day_alert_sent  = False
+        logger.info(f"Trading day reset → {today} (prev_pnl={prev_pnl:+.0f}pts was_locked={was_locked})")
+        # Only notify if user actually configured the lock OR was previously locked
+        if DAILY_MAX_LOSS_PTS is not None or was_locked:
+            self._safe_notify(
+                f"🌅 <b>Trading Day Reset</b>\n"
+                f"日期:{today}\n"
+                f"前日損益:{prev_pnl:+.0f} pts\n"
+                f"前日鎖手狀態:{'是 (已解除)' if was_locked else '否'}\n"
+                f"今日 MAX LOSS:{'未設定' if DAILY_MAX_LOSS_PTS is None else f'{DAILY_MAX_LOSS_PTS:+.0f} pts'}"
+            )
 
     # ── 新訊號偵測 ────────────────────────────────────────────────
 
@@ -375,6 +430,14 @@ class MTXStrategy:
         direction = trade.get("dir")
         product   = self.trader.config["product"]
 
+        # Phase 7: daily MAX LOSS gate. Only blocks real broker calls; startup state
+        # restore (place_order=False) is always allowed so locked positions resume tracking.
+        if place_order and self._trading_day_locked:
+            label = "加碼" if is_pyramid else "進場"
+            logger.warning(f"Daily MAX LOSS lock active — refusing {label} signal id={trade.get('id')}")
+            # No Telegram on each rejection (would spam); the original lock-trigger msg is enough
+            return
+
         if place_order:
             if direction == "long":
                 self._execute_order("BUY", product, 1)
@@ -460,6 +523,23 @@ class MTXStrategy:
             "pnl_pts":   pnl_pts,
             "reason":    reason,
         })
+        # Phase 7: accumulate into trading-day P&L counter (persists across session changes)
+        self._trading_day_pnl_pts += pnl_pts
+        if (DAILY_MAX_LOSS_PTS is not None
+                and not self._trading_day_locked
+                and self._trading_day_pnl_pts <= DAILY_MAX_LOSS_PTS):
+            self._trading_day_locked = True
+            logger.warning(f"DAILY_MAX_LOSS triggered: pnl={self._trading_day_pnl_pts:+.0f} ≤ {DAILY_MAX_LOSS_PTS:+.0f}")
+            if not self._trading_day_alert_sent:
+                self._trading_day_alert_sent = True
+                self._safe_notify(
+                    f"🛑 <b>每日 MAX LOSS 觸發</b>\n"
+                    f"今日損益:{self._trading_day_pnl_pts:+.0f} pts (NT${int(self._trading_day_pnl_pts * POINT_VALUE):,})\n"
+                    f"門檻:{DAILY_MAX_LOSS_PTS:+.0f} pts\n"
+                    f"動作:trader 已綁手,拒收新進場/加碼訊號\n"
+                    f"既有持倉依自然 SL/TP/反向繼續\n"
+                    f"重置時間:明早 08:45 TW"
+                )
         self._units.remove(unit)
 
         emoji     = EXIT_EMOJI.get(reason, "⏹")
