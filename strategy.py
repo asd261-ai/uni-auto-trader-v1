@@ -97,6 +97,12 @@ class MTXStrategy:
         self._trading_day_locked:  bool            = False
         self._trading_day_alert_sent: bool         = False  # one-shot Telegram on lock trigger
 
+        # Phase 6c-minimum: parallel FVG position tracker (FVG max 1 → single Optional).
+        # Set when FVG_MODE in ('paper','live') receives an 'open' signal; cleared on close.
+        # NOT in _units (no MTX path refactor needed). Shape:
+        #   {id, dir, entry, stop, target, label, opened_at}
+        self._fvg_position: Optional[Dict[str, Any]] = None
+
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
 
@@ -233,6 +239,8 @@ class MTXStrategy:
                 "last_seen_id":        self._last_seen_id,
                 "trading_day_pnl_pts": self._trading_day_pnl_pts,
                 "trading_day_locked":  self._trading_day_locked,
+                "fvg_mode":            FVG_OBSERVE_MODE,
+                "fvg_position_id":     self._fvg_position.get("id") if self._fvg_position else None,
             })
             time.sleep(POLL_INTERVAL)
 
@@ -670,13 +678,18 @@ class MTXStrategy:
             return []
 
     def _observe_fvg_signals(self, signals: list):
-        """Shadow mode: log + Telegram-notify FVG state transitions. NO broker calls.
+        """FVG signal handling per FVG_MODE:
+          - 'off'    : skip entirely
+          - 'shadow' : log + Telegram on transitions, NO broker calls
+          - 'paper'  : also track _fvg_position locally, NO broker calls
+          - 'live'   : also place real broker orders
 
         First poll primes the status map silently to avoid spamming historical entries.
         Subsequent polls notify only on (id, status) transitions.
         """
-        if FVG_OBSERVE_MODE != "shadow":
-            return  # 'off' returns nothing; 'paper'/'live' not yet implemented (Phase 6b/6c)
+        if FVG_OBSERVE_MODE not in ("shadow", "paper", "live"):
+            return
+        mode_tag = FVG_OBSERVE_MODE.upper()
         for sig in signals:
             sig_id = sig.get("id")
             status = sig.get("status", "")
@@ -693,11 +706,91 @@ class MTXStrategy:
             target  = sig.get("target", "?")
             pnl     = sig.get("pnl")
             pnl_str = f"  pnl={pnl:+.1f}" if isinstance(pnl, (int, float)) else ""
-            logger.info(f"FVG SHADOW {status} {dir_ch}@{entry} SL={stop} TP={target}{pnl_str} id={sig_id}")
+            logger.info(f"FVG {mode_tag} {status} {dir_ch}@{entry} SL={stop} TP={target}{pnl_str} id={sig_id}")
             self._safe_notify(
-                f"👁 <b>[FVG SHADOW]</b>  {status}\n"
+                f"👁 <b>[FVG {mode_tag}]</b>  {status}\n"
                 f"方向:{dir_ch}  進場 {entry}  停損 {stop}  停利 {target}{pnl_str}"
             )
+            # Phase 6c: paper/live modes also track local position + (live) place broker orders
+            if FVG_OBSERVE_MODE in ("paper", "live"):
+                self._fvg_handle_trade(sig)
         if not self._fvg_primed:
             self._fvg_primed = True
-            logger.info(f"FVG shadow primed: {len(self._fvg_last_status)} initial signal(s) absorbed silently")
+            logger.info(f"FVG {mode_tag} primed: {len(self._fvg_last_status)} initial signal(s) absorbed silently")
+
+    def _fvg_handle_trade(self, sig: dict):
+        """Phase 6c-minimum: FVG position lifecycle for paper/live modes.
+
+        Maintains self._fvg_position (Optional, single position because FVG engine is
+        single-position state machine). For 'live' mode, also places real broker orders.
+
+        NOT integrated into self._units (MTX path is untouched). On trader restart,
+        _fvg_position is lost — known limitation, see project_signal_bus.md notes.
+        """
+        is_live  = FVG_OBSERVE_MODE == "live"
+        sig_id   = sig.get("id")
+        status   = sig.get("status", "")
+        mode_tag = "LIVE" if is_live else "PAPER"
+
+        if status == "open":
+            # Refuse if already have an open FVG position (defensive — FVG engine
+            # shouldn't emit a second open while one is alive, but trust no one)
+            if self._fvg_position is not None:
+                logger.warning(f"FVG {mode_tag} entry {sig_id} ignored — existing position id={self._fvg_position.get('id')}")
+                return
+            # Refuse if daily MAX LOSS lock is engaged (only blocks LIVE broker calls;
+            # PAPER mode still tracks for analytics)
+            if is_live and self._trading_day_locked:
+                logger.warning(f"FVG LIVE entry {sig_id} rejected — daily MAX LOSS lock active")
+                self._safe_notify(f"🛑 [FVG LIVE] 進場訊號被綁手擋下 id={sig_id}")
+                return
+            # Track + (live) place broker order
+            self._fvg_position = {
+                "id":        sig_id,
+                "dir":       sig.get("dir"),
+                "entry":     sig.get("entry"),
+                "stop":      sig.get("stop"),
+                "target":    sig.get("target"),
+                "label":     sig.get("label", "FVG"),
+                "opened_at": int(time.time() * 1000),
+            }
+            if is_live:
+                product = self.trader.config["product"]
+                if self._fvg_position["dir"] == "long":
+                    self._execute_order("BUY", product, 1)
+                elif self._fvg_position["dir"] == "short":
+                    self._execute_order("SELL", product, 1)
+            logger.info(f"FVG {mode_tag} POSITION OPEN id={sig_id} dir={self._fvg_position['dir']} @{self._fvg_position['entry']}")
+
+        elif status in ("profit", "loss", "session_end"):
+            # Match by id (must be the position we opened)
+            if self._fvg_position is None or self._fvg_position.get("id") != sig_id:
+                logger.debug(f"FVG {mode_tag} {status} {sig_id} skipped — no matching local position")
+                return
+            # Place broker close if live
+            if is_live:
+                product = self.trader.config["product"]
+                if self._fvg_position["dir"] == "long":
+                    self._execute_order("SELL", product, 1, opencloseflag="1")
+                else:
+                    self._execute_order("BUY", product, 1, opencloseflag="1")
+            # Accumulate pnl into trading-day counter (whether paper or live —
+            # we want the daily lock to consider paper outcomes too, since paper
+            # is "what would have happened" and informs whether to keep going)
+            pnl_pts = sig.get("pnl") if isinstance(sig.get("pnl"), (int, float)) else 0
+            self._trading_day_pnl_pts += pnl_pts
+            if (DAILY_MAX_LOSS_PTS is not None
+                    and not self._trading_day_locked
+                    and self._trading_day_pnl_pts <= DAILY_MAX_LOSS_PTS):
+                self._trading_day_locked = True
+                if not self._trading_day_alert_sent:
+                    self._trading_day_alert_sent = True
+                    self._safe_notify(
+                        f"🛑 <b>每日 MAX LOSS 觸發 (via FVG)</b>\n"
+                        f"今日損益:{self._trading_day_pnl_pts:+.0f} pts (NT${int(self._trading_day_pnl_pts * POINT_VALUE):,})\n"
+                        f"門檻:{DAILY_MAX_LOSS_PTS:+.0f} pts\n"
+                        f"動作:trader 已綁手"
+                    )
+                logger.warning(f"DAILY_MAX_LOSS triggered via FVG: pnl={self._trading_day_pnl_pts:+.0f}")
+            logger.info(f"FVG {mode_tag} POSITION CLOSE id={sig_id} reason={status} pnl={pnl_pts:+.1f}pts")
+            self._fvg_position = None
