@@ -1,9 +1,11 @@
 import os
+import json
 import threading
 import time
 import logging
+from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone, timedelta, time as dtime
+from datetime import datetime, timezone, timedelta, date, time as dtime
 import requests
 
 import heartbeat
@@ -37,6 +39,10 @@ except ValueError:
     DAILY_MAX_LOSS_PTS = None
 
 TZ_TW = timezone(timedelta(hours=8))
+
+# Persistent trade log + monthly summary (append-only,跨 restart 持久化)
+TRADES_LOG_PATH      = Path(__file__).parent / "trades.jsonl"
+MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒"}
@@ -103,6 +109,15 @@ class MTXStrategy:
         #   {id, dir, entry, stop, target, label, opened_at}
         self._fvg_position: Optional[Dict[str, Any]] = None
 
+        # Persistent trades log + monthly P&L counters. Resets on month change (TW trading-day boundary).
+        # Restored from trades.jsonl at startup so restart doesn't lose mid-month state.
+        self._current_month:        Optional[str]            = None  # "YYYY-MM"
+        self._month_pnl_pts:        float                    = 0.0
+        self._month_trades_count:   int                      = 0
+        self._month_wins:           int                      = 0
+        self._month_losses:         int                      = 0
+        self._month_by_source:      Dict[str, Dict[str, Any]] = {}
+
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
 
@@ -146,6 +161,9 @@ class MTXStrategy:
         now = datetime.now(TZ_TW)
         self._current_session = _get_session(now)
         logger.info(f"Current session: {self._current_session}")
+
+        # Restore current-month P&L counters from trades.jsonl (so restart preserves state)
+        self._restore_month_from_log()
 
         self._running = True
         t = threading.Thread(target=self._poll_loop, daemon=True)
@@ -241,6 +259,9 @@ class MTXStrategy:
                 "trading_day_locked":  self._trading_day_locked,
                 "fvg_mode":            FVG_OBSERVE_MODE,
                 "fvg_position_id":     self._fvg_position.get("id") if self._fvg_position else None,
+                "month":               self._current_month,
+                "month_pnl_pts":       self._month_pnl_pts,
+                "month_trades_count":  self._month_trades_count,
             })
             time.sleep(POLL_INTERVAL)
 
@@ -257,20 +278,158 @@ class MTXStrategy:
             logger.info(f"{'日盤' if session == 'day' else '夜盤'}開始")
             threading.Thread(target=self._send_open_notify, args=(session,), daemon=True).start()
 
+    @staticmethod
+    def _compute_trading_day(now: datetime) -> date:
+        """Trading day boundary at 08:45 TW. Before 08:45 = yesterday's trading day."""
+        return (now - timedelta(days=1)).date() if now.time() < dtime(8, 45) else now.date()
+
+    def _record_trade(self, *, source: str, label: str, dir_: str, entry, exit_price,
+                       stop, target, pnl_pts: float, reason: str, sig_id, opened_at_ms):
+        """Append one trade record to trades.jsonl AND update monthly counters.
+
+        Called from _close_unit (MTX) and _fvg_handle_trade (FVG close branch).
+        Wraps file I/O + counter math in try/except so failures don't break trading.
+        """
+        try:
+            now = datetime.now(TZ_TW)
+            trading_day = self._compute_trading_day(now)
+            duration_sec = None
+            if isinstance(opened_at_ms, (int, float)) and opened_at_ms > 0:
+                duration_sec = int(time.time() - opened_at_ms / 1000)
+            record = {
+                "ts":           int(time.time()),
+                "trading_day":  trading_day.isoformat(),
+                "session":      self._current_session,
+                "source":       source,
+                "id":           sig_id,
+                "label":        label,
+                "dir":          dir_,
+                "entry":        entry,
+                "exit":         exit_price,
+                "stop":         stop,
+                "target":       target,
+                "pnl_pts":      pnl_pts,
+                "pnl_ntd":      int(pnl_pts * POINT_VALUE) if pnl_pts else 0,
+                "reason":       reason,
+                "duration_sec": duration_sec,
+            }
+            with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"trades.jsonl write failed: {e}")
+        # Update monthly counters (in-memory)
+        self._month_pnl_pts      += pnl_pts
+        self._month_trades_count += 1
+        if pnl_pts > 0:
+            self._month_wins   += 1
+        elif pnl_pts < 0:
+            self._month_losses += 1
+        bucket = self._month_by_source.setdefault(source, {"pnl_pts": 0.0, "count": 0, "wins": 0, "losses": 0})
+        bucket["pnl_pts"] += pnl_pts
+        bucket["count"]   += 1
+        if pnl_pts > 0:
+            bucket["wins"]   += 1
+        elif pnl_pts < 0:
+            bucket["losses"] += 1
+
+    def _archive_and_reset_month(self, old_month: str, new_month: str):
+        """Called on month boundary (trading-day basis). Writes summary to
+        monthly_summary.jsonl + Telegram notification + resets in-memory counters."""
+        try:
+            wr = self._month_wins / max(self._month_trades_count, 1) * 100
+            summary = {
+                "month":         old_month,
+                "total_pnl_pts": self._month_pnl_pts,
+                "total_pnl_ntd": int(self._month_pnl_pts * POINT_VALUE),
+                "trades":        self._month_trades_count,
+                "wins":          self._month_wins,
+                "losses":        self._month_losses,
+                "win_rate_pct":  round(wr, 2),
+                "by_source":     self._month_by_source,
+                "archived_at":   int(time.time() * 1000),
+            }
+            with open(MONTHLY_SUMMARY_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+            # Telegram summary
+            by_src_parts = []
+            for src, d in self._month_by_source.items():
+                sign = "+" if d.get("pnl_pts", 0) >= 0 else ""
+                by_src_parts.append(f"{src.upper()} {sign}{d.get('pnl_pts', 0):.0f}pts ({d.get('count', 0)})")
+            by_src_line = "  ".join(by_src_parts) if by_src_parts else "(無)"
+            sign = "+" if self._month_pnl_pts >= 0 else ""
+            self._safe_notify(
+                f"🌙 <b>月結 — {old_month}</b>\n"
+                f"總筆數:{self._month_trades_count}\n"
+                f"勝/敗:{self._month_wins}/{self._month_losses} ({wr:.1f}%)\n"
+                f"合計:{sign}{self._month_pnl_pts:.0f} pts ({sign}NT${int(self._month_pnl_pts * POINT_VALUE):,})\n"
+                f"依來源:{by_src_line}\n"
+                f"📅 {new_month} 起重新計算"
+            )
+            logger.info(f"Month archived: {old_month} pnl={self._month_pnl_pts:+.0f}pts trades={self._month_trades_count}")
+        except Exception as e:
+            logger.error(f"month archive failed: {e}")
+        # Reset counters (always, even if archive write failed — don't double-count)
+        self._month_pnl_pts        = 0.0
+        self._month_trades_count   = 0
+        self._month_wins           = 0
+        self._month_losses         = 0
+        self._month_by_source      = {}
+
+    def _restore_month_from_log(self):
+        """On startup, scan trades.jsonl, filter to current month (trading-day basis),
+        sum into _month_* counters so restart doesn't lose mid-month state."""
+        now = datetime.now(TZ_TW)
+        td  = self._compute_trading_day(now)
+        current_month_str = td.strftime("%Y-%m")
+        self._current_month = current_month_str
+        if not TRADES_LOG_PATH.exists():
+            logger.info(f"No trades.jsonl yet — month {current_month_str} starts at 0")
+            return
+        try:
+            count = 0
+            with open(TRADES_LOG_PATH, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    rec_td = rec.get("trading_day", "")
+                    if not rec_td.startswith(current_month_str):
+                        continue
+                    pnl = rec.get("pnl_pts", 0) or 0
+                    src = rec.get("source", "?")
+                    self._month_pnl_pts      += pnl
+                    self._month_trades_count += 1
+                    if pnl > 0:   self._month_wins   += 1
+                    elif pnl < 0: self._month_losses += 1
+                    bucket = self._month_by_source.setdefault(src, {"pnl_pts": 0.0, "count": 0, "wins": 0, "losses": 0})
+                    bucket["pnl_pts"] += pnl
+                    bucket["count"]   += 1
+                    if pnl > 0:   bucket["wins"]   += 1
+                    elif pnl < 0: bucket["losses"] += 1
+                    count += 1
+            logger.info(f"Monthly restored: month={current_month_str} pnl={self._month_pnl_pts:+.0f}pts trades={self._month_trades_count} (read {count} lines)")
+        except Exception as e:
+            logger.warning(f"Monthly restore failed (continuing with 0s): {e}")
+
     def _check_trading_day_reset(self):
         """Reset daily P&L counter when trading day flips (08:45 TW).
-
-        Trading day boundary: 08:45 TW (day session open). Before that, today's
-        time belongs to yesterday's trading day. So overnight break (05:00–08:44)
-        is "still yesterday's trading day" from a P&L lock perspective.
+        Also detects MONTH change → archive monthly summary + Telegram + reset.
         """
         now   = datetime.now(TZ_TW)
-        today = (now - timedelta(days=1)).date() if now.time() < dtime(8, 45) else now.date()
+        today = self._compute_trading_day(now)
+        # First call: initialize state, no reset action
         if self._trading_day_date is None:
             self._trading_day_date = today
+            if self._current_month is None:
+                self._current_month = today.strftime("%Y-%m")
             return
         if today == self._trading_day_date:
             return
+        # --- Trading day changed: reset daily lock state ---
         prev_pnl     = self._trading_day_pnl_pts
         was_locked   = self._trading_day_locked
         self._trading_day_date        = today
@@ -278,7 +437,6 @@ class MTXStrategy:
         self._trading_day_locked      = False
         self._trading_day_alert_sent  = False
         logger.info(f"Trading day reset → {today} (prev_pnl={prev_pnl:+.0f}pts was_locked={was_locked})")
-        # Only notify if user actually configured the lock OR was previously locked
         if DAILY_MAX_LOSS_PTS is not None or was_locked:
             self._safe_notify(
                 f"🌅 <b>Trading Day Reset</b>\n"
@@ -287,6 +445,11 @@ class MTXStrategy:
                 f"前日鎖手狀態:{'是 (已解除)' if was_locked else '否'}\n"
                 f"今日 MAX LOSS:{'未設定' if DAILY_MAX_LOSS_PTS is None else f'{DAILY_MAX_LOSS_PTS:+.0f} pts'}"
             )
+        # --- Month changed? archive prev month, reset counters ---
+        new_month = today.strftime("%Y-%m")
+        if self._current_month is not None and new_month != self._current_month:
+            self._archive_and_reset_month(self._current_month, new_month)
+        self._current_month = new_month
 
     # ── 新訊號偵測 ────────────────────────────────────────────────
 
@@ -462,6 +625,7 @@ class MTXStrategy:
             "stop":      trade.get("stop"),
             "target":    trade.get("target"),
             "sig_label": trade.get("sigLabel", ""),
+            "opened_at": int(time.time() * 1000),  # epoch ms, for trade duration calc
         }
         self._units.append(unit)
         logger.info(f"Unit {len(self._units)} opened | {direction} entry={unit['entry']} stop={unit['stop']}")
@@ -531,6 +695,13 @@ class MTXStrategy:
             "pnl_pts":   pnl_pts,
             "reason":    reason,
         })
+        # Persistent trade log + monthly counters (跨 restart 持久化)
+        self._record_trade(
+            source="mtx", label=unit["sig_label"], dir_=unit["dir"],
+            entry=unit["entry"], exit_price=exit_price, stop=unit["stop"],
+            target=unit["target"], pnl_pts=pnl_pts, reason=reason,
+            sig_id=unit["id"], opened_at_ms=unit.get("opened_at"),
+        )
         # Phase 7: accumulate into trading-day P&L counter (persists across session changes)
         self._trading_day_pnl_pts += pnl_pts
         if (DAILY_MAX_LOSS_PTS is not None
@@ -778,6 +949,15 @@ class MTXStrategy:
             # we want the daily lock to consider paper outcomes too, since paper
             # is "what would have happened" and informs whether to keep going)
             pnl_pts = sig.get("pnl") if isinstance(sig.get("pnl"), (int, float)) else 0
+            # Persistent trade log + monthly counters
+            exit_price = sig.get("meta", {}).get("exit_price")
+            self._record_trade(
+                source="fvg", label=self._fvg_position.get("label", "FVG"), dir_=self._fvg_position["dir"],
+                entry=self._fvg_position["entry"], exit_price=exit_price,
+                stop=self._fvg_position["stop"], target=self._fvg_position["target"],
+                pnl_pts=pnl_pts, reason=status,
+                sig_id=sig_id, opened_at_ms=self._fvg_position.get("opened_at"),
+            )
             self._trading_day_pnl_pts += pnl_pts
             if (DAILY_MAX_LOSS_PTS is not None
                     and not self._trading_day_locked
