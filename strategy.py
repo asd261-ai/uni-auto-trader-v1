@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import logging
@@ -5,6 +6,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta, time as dtime
 import requests
 
+import heartbeat
 import telegram_notify as tg
 
 logger = logging.getLogger(__name__)
@@ -184,6 +186,15 @@ class MTXStrategy:
                 self._check_new_signal(history)   # ② then pick up new signals with fresh state
             except Exception as e:
                 logger.error(f"Poll error: {e}")
+            # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
+            # errors (watchdog needs to see "process alive but polls failing" as a signal).
+            heartbeat.send({
+                "ts":           int(time.time() * 1000),
+                "pid":          os.getpid(),
+                "session":      self._current_session,
+                "units":        len(self._units),
+                "last_seen_id": self._last_seen_id,
+            })
             time.sleep(POLL_INTERVAL)
 
     def _check_session_change(self):
