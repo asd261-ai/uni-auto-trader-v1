@@ -1,0 +1,7 @@
+{
+  "allowedHosts": [
+    "api.asd261.com",
+    "mtx-monitor.asd261-af5.workers.dev",
+    "api.telegram.org"
+  ]
+}
