@@ -11,6 +11,7 @@ class AutoTrader:
         self.api = Unitrade()
         self.actno: str = ""
         self._running = False
+        self._connected = False  # 首次連線後才為 True，用於區分首次 vs 重連
         self.strategy = None  # 由外部注入 MTXStrategy
 
     # ── 啟動 / 停止 ──────────────────────────────────────────────
@@ -51,9 +52,11 @@ class AutoTrader:
 
     def _register_callbacks(self):
         self.api.dquote.on_tick_data_trade = self._on_tick
-        self.api.dtrade.on_reply = self._on_reply
-        self.api.dtrade.on_match = self._on_match
-        self.api.on_error = self._on_error
+        self.api.dtrade.on_reply           = self._on_reply
+        self.api.dtrade.on_match           = self._on_match
+        self.api.dtrade.on_connected       = self._on_connected
+        self.api.dtrade.on_disonnected     = self._on_disconnected  # 官方 typo，少一個 c
+        self.api.on_error                  = self._on_error
 
     def _subscribe(self):
         ok, err = self.api.dquote.subscribe_trade_bid_offer(self.config["product"])
@@ -76,6 +79,45 @@ class AutoTrader:
 
     def _on_error(self, error):
         logger.error(f"API error: {error}")
+
+    def _on_connected(self):
+        if not self._connected:
+            # 首次連線，記錄後跳過
+            self._connected = True
+            logger.info("dtrade connected (initial)")
+            return
+        # 重連
+        logger.warning("dtrade reconnected — querying broker position")
+        broker_pos = self._query_broker_position()
+        if self.strategy:
+            self.strategy.on_reconnect(broker_pos)
+
+    def _on_disconnected(self):
+        status = getattr(self.api.dtrade, "last_disconnect_status", "unknown")
+        secs   = getattr(self.api.dtrade, "last_disconnect_seconds", "?")
+        logger.warning(f"dtrade disconnected | status={status} | duration={secs}s")
+        if self.strategy:
+            self.strategy.on_disconnect()
+
+    def _query_broker_position(self) -> dict | None:
+        """查詢券商端目前持倉，回傳 {productid, bs, qty} 或 None。"""
+        try:
+            self.api.daccount.start()
+            positions = self.api.daccount.get_position()
+            if not positions:
+                return None
+            # 只取 MXFG5（或設定中的 product）
+            product = self.config["product"]
+            for p in positions:
+                if getattr(p, "productid", "") == product:
+                    return {
+                        "productid": p.productid,
+                        "bs":        getattr(p, "bs", ""),
+                        "qty":       getattr(p, "qty", 0),
+                    }
+        except Exception as e:
+            logger.error(f"Position query failed: {e}")
+        return None
 
     # ── 下單工具 ──────────────────────────────────────────────────
 
