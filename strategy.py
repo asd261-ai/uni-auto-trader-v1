@@ -18,7 +18,7 @@ PYRAMID_LOCK  = 15    # pts — first unit stop locked to entry ± this on pyram
 TZ_TW = timezone(timedelta(hours=8))
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
-EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁"}
+EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒"}
 
 
 def _get_session(dt: datetime) -> str:
@@ -280,6 +280,14 @@ class MTXStrategy:
                     logger.info(f"Worker exit (profit) | id={unit['id']}")
                     self._close_unit(unit, "profit", exit_price=exit_price)
 
+                elif status == "trail":
+                    # Worker (worker/index.js:782/785) writes status='trail' when trailing stop hits.
+                    # Use the trail-stop level as exit_price; Worker's t.pnl already reflects locked profit.
+                    pnl        = our_trade.get("pnl") or 0
+                    exit_price = our_trade.get("stop")
+                    logger.info(f"Worker exit (trail) | id={unit['id']}")
+                    self._close_unit(unit, "trail", exit_price=exit_price)
+
                 elif status == "reversed":
                     # Worker stores P&L in t.pnl (= triggering-trade entry ± our entry).
                     pnl        = our_trade.get("pnl") or 0
@@ -430,7 +438,8 @@ class MTXStrategy:
 
         emoji     = EXIT_EMOJI.get(reason, "⏹")
         reason_zh = {"profit": "停利出場", "loss": "停損出場",
-                     "reversed": "反向平倉", "replaced": "汰換平倉"}.get(reason, reason)
+                     "reversed": "反向平倉", "replaced": "汰換平倉",
+                     "trail": "移動停利"}.get(reason, reason)
         dry_tag   = " [模擬]" if self.dry_run else ""
         pnl_sign  = "+" if pnl_pts >= 0 else ""
         pnl_line  = (f"損益：<b>{pnl_sign}{pnl_pts:.0f} pts（{pnl_sign}NT${pnl_ntd:,}）</b>"
