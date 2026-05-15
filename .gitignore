@@ -9,3 +9,5 @@ dist/
 logs/
 *.pfx
 orders.jsonl
+trades.jsonl
+monthly_summary.jsonl

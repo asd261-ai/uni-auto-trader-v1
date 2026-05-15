@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta, date, time as dtime
 import requests
 
 import heartbeat
+import trade_log_emit
 import telegram_notify as tg
 
 logger = logging.getLogger(__name__)
@@ -315,6 +316,8 @@ class MTXStrategy:
             }
             with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Cloud backup (Worker /api/trade_log,Worker 端 dedup by (id, reason))
+            trade_log_emit.send(record)
         except Exception as e:
             logger.error(f"trades.jsonl write failed: {e}")
         # Update monthly counters (in-memory)
