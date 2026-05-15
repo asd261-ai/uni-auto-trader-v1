@@ -45,6 +45,10 @@ TZ_TW = timezone(timedelta(hours=8))
 TRADES_LOG_PATH      = Path(__file__).parent / "trades.jsonl"
 MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 
+# Plan D: broker reconciliation
+RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
+RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
+
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒"}
 
@@ -118,6 +122,17 @@ class MTXStrategy:
         self._month_wins:           int                      = 0
         self._month_losses:         int                      = 0
         self._month_by_source:      Dict[str, Dict[str, Any]] = {}
+
+        # Plan D: broker reconciliation safety net. Periodically (~1 min) compare
+        # broker's actual net position vs trader's expected (sum of _units MTX +
+        # _fvg_position FVG). Mismatch persisting > RECON_ALERT_AGE_SEC → Telegram
+        # alert. Catches drift like the 2026-05-16 FVG engine non-determinism bug
+        # where broker has a position but trader's _fvg_position is None.
+        self._recon_last_check:      float                  = 0.0    # epoch s of last check
+        self._recon_mismatch_since:  Optional[float]        = None   # when mismatch first observed
+        self._recon_alert_sent:      bool                   = False  # one-shot dedup
+        self._recon_last_broker_net: Optional[int]          = None   # last observed broker signed net (for heartbeat)
+        self._recon_last_expected:   Optional[int]          = None   # last computed expected signed net
 
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
@@ -248,6 +263,11 @@ class MTXStrategy:
                 self._observe_fvg_signals(self._fetch_fvg_signals())
             except Exception as e:
                 logger.debug(f"FVG observe error (silent): {e}")
+            # Plan D: broker reconciliation safety net (throttled to ~1 min via internal check)
+            try:
+                self._check_broker_reconciliation()
+            except Exception as e:
+                logger.debug(f"recon error (silent): {e}")
             # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
             # errors (watchdog needs to see "process alive but polls failing" as a signal).
             heartbeat.send({
@@ -263,6 +283,9 @@ class MTXStrategy:
                 "month":               self._current_month,
                 "month_pnl_pts":       self._month_pnl_pts,
                 "month_trades_count":  self._month_trades_count,
+                "recon_broker_net":    self._recon_last_broker_net,
+                "recon_expected_net":  self._recon_last_expected,
+                "recon_alert_sent":    self._recon_alert_sent,
             })
             time.sleep(POLL_INTERVAL)
 
@@ -417,6 +440,86 @@ class MTXStrategy:
             logger.info(f"Monthly restored: month={current_month_str} pnl={self._month_pnl_pts:+.0f}pts trades={self._month_trades_count} (read {count} lines)")
         except Exception as e:
             logger.warning(f"Monthly restore failed (continuing with 0s): {e}")
+
+    def _expected_net_position(self) -> int:
+        """Trader's expected signed net lots = sum of MTX _units + FVG _fvg_position."""
+        net = 0
+        for u in self._units:
+            net += 1 if u["dir"] == "long" else -1
+        if self._fvg_position is not None:
+            net += 1 if self._fvg_position["dir"] == "long" else -1
+        return net
+
+    def _check_broker_reconciliation(self):
+        """Plan D safety net: compare broker's actual net position vs trader's
+        expected net. Persistent mismatch (>3 min) → Telegram alert.
+
+        Catches drift scenarios like the 2026-05-16 FVG bug where broker has
+        a position but trader's _fvg_position is None (or vice versa).
+        Throttled to once per RECON_CHECK_INTERVAL_SEC (~1 min) to be API-polite.
+        """
+        now = time.time()
+        if now - self._recon_last_check < RECON_CHECK_INTERVAL_SEC:
+            return
+        self._recon_last_check = now
+
+        try:
+            broker_pos = self.trader._query_broker_position()
+        except Exception as e:
+            logger.debug(f"recon: broker query failed (silent): {e}")
+            return
+
+        # Broker returns {productid, bs, qty} or None.
+        if broker_pos is None:
+            broker_net = 0
+        else:
+            qty = int(broker_pos.get("qty", 0) or 0)
+            bs  = broker_pos.get("bs", "")
+            broker_net = qty if bs == "B" else (-qty if bs == "S" else 0)
+
+        expected_net = self._expected_net_position()
+        self._recon_last_broker_net = broker_net
+        self._recon_last_expected   = expected_net
+
+        if broker_net == expected_net:
+            # Aligned — clear any prior mismatch state, notify recovery if alerted
+            if self._recon_alert_sent:
+                logger.info(f"Broker recon recovered: net={broker_net}")
+                self._safe_notify(
+                    f"✅ <b>Broker 對帳已恢復</b>\n"
+                    f"目前 net = {broker_net} 口\n"
+                    f"(trader 視角 {expected_net} 口,broker {broker_net} 口,一致)"
+                )
+            self._recon_mismatch_since = None
+            self._recon_alert_sent     = False
+            return
+
+        # Mismatch detected
+        if self._recon_mismatch_since is None:
+            self._recon_mismatch_since = now
+            logger.warning(f"Broker recon mismatch: expected={expected_net} broker={broker_net} (starting tolerance window)")
+            return
+
+        age = now - self._recon_mismatch_since
+        logger.debug(f"recon mismatch ongoing: expected={expected_net} broker={broker_net} age={age:.0f}s")
+        if age > RECON_ALERT_AGE_SEC and not self._recon_alert_sent:
+            self._recon_alert_sent = True
+            # Build context for alert
+            mtx_count = len(self._units)
+            mtx_long  = sum(1 for u in self._units if u["dir"] == "long")
+            mtx_short = mtx_count - mtx_long
+            fvg_str   = f"{self._fvg_position['dir']} (id={self._fvg_position['id']})" if self._fvg_position else "(無)"
+            logger.error(f"DAILY_RECON_ALERT: broker_net={broker_net} expected_net={expected_net} age={age:.0f}s")
+            self._safe_notify(
+                f"⚠️ <b>Broker 對帳異常 {int(age/60)} 分鐘</b>\n"
+                f"Trader 預期: <b>{expected_net} 口</b>\n"
+                f"  MTX _units: {mtx_count} ({mtx_long} long / {mtx_short} short)\n"
+                f"  FVG _fvg_position: {fvg_str}\n"
+                f"Broker 實際: <b>{broker_net} 口</b>\n"
+                f"差距: <b>{broker_net - expected_net:+d} 口</b>\n"
+                f"建議:檢查是否 FVG bot engine 漏 close 訊號(見 [[feedback-fvg-engine-multi-open-bug]]),"
+                f"或執行 /flat-position skill 手動對齊"
+            )
 
     def _check_trading_day_reset(self):
         """Reset daily P&L counter when trading day flips (08:45 TW).
