@@ -1,6 +1,7 @@
 import time
 import logging
 from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
+import order_log
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +74,13 @@ class AutoTrader:
 
     def _on_reply(self, reply):
         logger.info(f"Reply | {reply.productid} {reply.bs} status={reply.orderstatus} orderno={reply.orderno}")
+        order_log.log_event("reply", productid=reply.productid, bs=reply.bs,
+                            orderno=reply.orderno, orderstatus=reply.orderstatus)
 
     def _on_match(self, match):
         logger.info(f"Match | {match.productid} {match.bs} price={match.matchprice} qty={match.matchqty} orderno={match.orderno}")
+        order_log.log_event("match", productid=match.productid, bs=match.bs,
+                            orderno=match.orderno, matchprice=match.matchprice, matchqty=match.matchqty)
 
     def _on_error(self, error):
         logger.error(f"API error: {error}")
@@ -148,6 +153,8 @@ class AutoTrader:
         order.ordercondition = "R"   # R:ROD I:IOC F:FOK
         order.opencloseflag = opencloseflag  # "":自動 "0":新倉 "1":平倉
         order.dtrade = "N"
+        order_log.log_event("sent", productid=productid, bs=bs, qty=qty,
+                            ordertype=ordertype, price=price, opencloseflag=opencloseflag)
         resp = self.api.dtrade.order(order)
         if not resp.issend:
             logger.error(f"Order failed: {resp.errormsg}")

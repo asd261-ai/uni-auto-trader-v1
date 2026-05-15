@@ -8,3 +8,4 @@ venv/
 dist/
 logs/
 *.pfx
+orders.jsonl
