@@ -11,7 +11,12 @@ import telegram_notify as tg
 
 logger = logging.getLogger(__name__)
 
-HISTORY_URL   = "https://mtx-monitor.asd261-af5.workers.dev/api/history"
+HISTORY_URL      = "https://mtx-monitor.asd261-af5.workers.dev/api/history"
+FVG_SIGNALS_URL  = "https://mtx-monitor.asd261-af5.workers.dev/api/signals?source=fvg"
+# Phase 6a-lite: 'shadow' fetches FVG signals and logs/notifies but does NOT trade.
+# Future modes: 'off' (skip entirely), 'paper' (full _units tracking, no broker),
+# 'live' (real orders — needs Phase 6c kill-switch + multi-account safety).
+FVG_OBSERVE_MODE = os.getenv("FVG_MODE", "shadow")
 POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
 MAX_UNITS     = 2     # match Worker MAX_UNITS
@@ -66,6 +71,10 @@ class MTXStrategy:
         self._session_trades:  List[dict]    = []
         self._prev_session_pnl_pts: float    = 0.0
         self._prev_session_label:   str      = ""
+
+        # Phase 6a-lite: FVG shadow observation (fetch + log, no trade)
+        self._fvg_last_status: Dict[int, str] = {}  # signal_id → last-seen status
+        self._fvg_primed:       bool          = False  # True after first poll absorbs initial state silently
 
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
@@ -186,6 +195,12 @@ class MTXStrategy:
                 self._check_new_signal(history)   # ② then pick up new signals with fresh state
             except Exception as e:
                 logger.error(f"Poll error: {e}")
+            # Phase 6a-lite: FVG shadow observation (separate try/except so MTX path is never
+            # affected by FVG side issues — shadow is observational only, must never break trader).
+            try:
+                self._observe_fvg_signals(self._fetch_fvg_signals())
+            except Exception as e:
+                logger.debug(f"FVG observe error (silent): {e}")
             # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
             # errors (watchdog needs to see "process alive but polls failing" as a signal).
             heartbeat.send({
@@ -561,3 +576,48 @@ class MTXStrategy:
         resp = requests.get(HISTORY_URL, timeout=10)
         resp.raise_for_status()
         return resp.json() or []
+
+    # ── Phase 6a-lite: FVG shadow observation ─────────────────────
+    def _fetch_fvg_signals(self) -> list:
+        if FVG_OBSERVE_MODE == "off":
+            return []
+        try:
+            resp = requests.get(FVG_SIGNALS_URL, timeout=10)
+            resp.raise_for_status()
+            return resp.json() or []
+        except Exception as e:
+            logger.debug(f"FVG fetch failed (silent): {e}")
+            return []
+
+    def _observe_fvg_signals(self, signals: list):
+        """Shadow mode: log + Telegram-notify FVG state transitions. NO broker calls.
+
+        First poll primes the status map silently to avoid spamming historical entries.
+        Subsequent polls notify only on (id, status) transitions.
+        """
+        if FVG_OBSERVE_MODE != "shadow":
+            return  # 'off' returns nothing; 'paper'/'live' not yet implemented (Phase 6b/6c)
+        for sig in signals:
+            sig_id = sig.get("id")
+            status = sig.get("status", "")
+            if not isinstance(sig_id, int) or not status:
+                continue
+            if self._fvg_last_status.get(sig_id) == status:
+                continue
+            self._fvg_last_status[sig_id] = status
+            if not self._fvg_primed:
+                continue  # silent priming on first poll
+            dir_ch  = sig.get("dir", "?")
+            entry   = sig.get("entry", "?")
+            stop    = sig.get("stop", "?")
+            target  = sig.get("target", "?")
+            pnl     = sig.get("pnl")
+            pnl_str = f"  pnl={pnl:+.1f}" if isinstance(pnl, (int, float)) else ""
+            logger.info(f"FVG SHADOW {status} {dir_ch}@{entry} SL={stop} TP={target}{pnl_str} id={sig_id}")
+            self._safe_notify(
+                f"👁 <b>[FVG SHADOW]</b>  {status}\n"
+                f"方向:{dir_ch}  進場 {entry}  停損 {stop}  停利 {target}{pnl_str}"
+            )
+        if not self._fvg_primed:
+            self._fvg_primed = True
+            logger.info(f"FVG shadow primed: {len(self._fvg_last_status)} initial signal(s) absorbed silently")
