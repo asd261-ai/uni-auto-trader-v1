@@ -10,7 +10,7 @@ import telegram_notify as tg
 logger = logging.getLogger(__name__)
 
 HISTORY_URL   = "https://mtx-monitor.asd261-af5.workers.dev/api/history"
-POLL_INTERVAL = 15    # seconds
+POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
 MAX_UNITS     = 2     # match Worker MAX_UNITS
 PYRAMID_LOCK  = 15    # pts — first unit stop locked to entry ± this on pyramid
