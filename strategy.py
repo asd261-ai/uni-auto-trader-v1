@@ -257,6 +257,10 @@ class MTXStrategy:
         with self._lock:
             units = self._flatten_units()
         logger.warning(f"Disconnected | local units={len(units)}")
+        # Weekend: market closed → broker disconnect expected, suppress Telegram notify
+        if datetime.now(TZ_TW).weekday() >= 5:
+            logger.info("Disconnect notify suppressed (weekend)")
+            return
         if units:
             pos_desc = ", ".join(
                 f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}[{u.get('source','?').upper()}]" for u in units
@@ -276,6 +280,11 @@ class MTXStrategy:
         net = sum(1 if u["dir"] == "long" else -1 for u in units)
         local_dir = "long" if net > 0 else ("short" if net < 0 else None)
         logger.warning(f"Reconnected | local_units={len(units)} net={net} | broker={broker_pos}")
+
+        # Weekend: market closed → suppress Telegram notify (same rationale as on_disconnect)
+        if datetime.now(TZ_TW).weekday() >= 5:
+            logger.info("Reconnect notify suppressed (weekend)")
+            return
 
         if broker_pos:
             broker_dir = "long" if broker_pos.get("bs") == "B" else "short"
