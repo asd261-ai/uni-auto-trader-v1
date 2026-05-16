@@ -14,16 +14,30 @@ import telegram_notify as tg
 
 logger = logging.getLogger(__name__)
 
-HISTORY_URL      = "https://mtx-monitor.asd261-af5.workers.dev/api/history"
-FVG_SIGNALS_URL  = "https://mtx-monitor.asd261-af5.workers.dev/api/signals?source=fvg"
-# Phase 6a-lite: 'shadow' fetches FVG signals and logs/notifies but does NOT trade.
-# Future modes: 'off' (skip entirely), 'paper' (full _units tracking, no broker),
-# 'live' (real orders — needs Phase 6c kill-switch + multi-account safety).
+# Phase 6b: multi-source signal bus.
+# Each source has its own URL, max-units, and (for FVG) operating mode.
+# MTX path is unchanged behaviorally — it now just lives under _units['mtx'].
+HISTORY_URL     = "https://mtx-monitor.asd261-af5.workers.dev/api/history"
+FVG_SIGNALS_URL = "https://mtx-monitor.asd261-af5.workers.dev/api/signals?source=fvg"
+
+SIGNAL_SOURCES = [
+    {"source": "mtx", "url": HISTORY_URL},
+    {"source": "fvg", "url": FVG_SIGNALS_URL},
+]
+
+# Per-source max units. MTX pyramids up to 2, FVG engine is single-position.
+MAX_UNITS_PER_SOURCE: Dict[str, int] = {"mtx": 2, "fvg": 1}
+
+# FVG operating mode (env): off | shadow | paper | live
+#   off    : skip fetch entirely
+#   shadow : fetch + log + Telegram; never touch _units, never call broker
+#   paper  : fetch + go through _check_new_signal/_sync_worker_state, but skip broker
+#   live   : full pipeline including broker orders
 FVG_OBSERVE_MODE = os.getenv("FVG_MODE", "shadow")
+
 POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
-MAX_UNITS     = 2     # match Worker MAX_UNITS — kept for MTX backwards-compat, will be removed in Phase 6b
-PYRAMID_LOCK  = 15    # pts — first unit stop locked to entry ± this on pyramid
+PYRAMID_LOCK  = 15    # pts — first MTX unit stop locked to entry ± this on pyramid
 
 # ── Daily MAX LOSS lock (Phase 7 minimum) ──────────────────────────
 # When today's cumulative P&L (across all sources, across day+night sessions)
@@ -45,10 +59,9 @@ TZ_TW = timezone(timedelta(hours=8))
 TRADES_LOG_PATH      = Path(__file__).parent / "trades.jsonl"
 MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 
-# FVG live-trade position persistent state (Plan A on trader side).
-# Without this, trader restart loses _fvg_position → broker FVG positions stuck
-# without trader tracking → Plan D detects but user must manually flat.
-# With persistence, restart restores trader's view of the open FVG trade.
+# FVG position persistent state (Plan A trader-side companion). Phase 6b stores
+# _units['fvg'] (list of 0/1 units). MTX is restored from Worker KV at startup,
+# so we don't persist it locally.
 FVG_STATE_PATH       = Path(__file__).parent / "fvg_state.json"
 
 # Plan D: broker reconciliation
@@ -56,7 +69,9 @@ RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
 RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
-EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒"}
+EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
+               "session_end": "🌙"}
+SOURCE_TAG  = {"mtx": "", "fvg": "[FVG] "}  # MTX has no prefix (default channel); FVG gets a tag
 
 
 def _get_session(dt: datetime) -> str:
@@ -70,16 +85,24 @@ def _get_session(dt: datetime) -> str:
 
 class MTXStrategy:
     """
-    Polls MTX-1 Monitor /api/history and mirrors Worker's position state.
-    Supports up to MAX_UNITS=2 simultaneous positions (matching Worker pyramiding).
+    Phase 6b unified strategy executor. Polls one or more signal sources
+    (currently MTX `/api/history` + FVG `/api/signals?source=fvg`) and mirrors
+    each source's state via per-source `_units` lists.
 
     Key design decisions:
-    - _sync_worker_state runs BEFORE _check_new_signal each poll cycle,
-      so local state is cleared before evaluating new signals.
-    - _check_new_signal scans ALL new trade IDs (not just history[0]),
+    - `_units` is keyed by source. MTX has its own list, FVG has its own list.
+      `MAX_UNITS_PER_SOURCE` caps each source independently.
+    - For each source per poll: `_sync_worker_state` runs BEFORE `_check_new_signal`,
+      so local state clears closed positions before evaluating new signals.
+    - `_check_new_signal` scans ALL new trade IDs (not just history[0]),
       oldest-first, to avoid missing intermediate trades.
-    - Same-direction skip does NOT update _last_seen_id, allowing retry
+    - Same-direction skip does NOT update `_last_seen_id`, allowing retry
       after the existing position is closed by sync.
+    - FVG_OBSERVE_MODE gates FVG side:
+        off    → skip
+        shadow → observe-only via _observe_fvg_signals (no _units, no broker)
+        paper  → full unified path but skip broker
+        live   → full unified path including broker
     """
 
     def __init__(self, trader, dry_run: bool = True):
@@ -90,11 +113,14 @@ class MTXStrategy:
 
         self._lock = threading.Lock()
 
-        # Multi-unit position tracking
-        # Each entry: {id, dir, entry, stop, target, sig_label}
-        self._units: List[Dict[str, Any]] = []
+        # Phase 6b: per-source unit lists. Each unit dict carries its own `source` tag
+        # so downstream helpers (_close_unit, _check_exit_unit) can branch on it.
+        self._units: Dict[str, List[Dict[str, Any]]] = {"mtx": [], "fvg": []}
 
-        self._last_seen_id: Optional[int] = None
+        # Phase 6b: per-source last-seen signal id. Independent cursor per source so
+        # MTX and FVG histories don't interfere with each other.
+        self._last_seen_id: Dict[str, Optional[int]] = {"mtx": None, "fvg": None}
+
         self._running = False
 
         # Session tracking
@@ -103,8 +129,8 @@ class MTXStrategy:
         self._prev_session_pnl_pts: float    = 0.0
         self._prev_session_label:   str      = ""
 
-        # Phase 6a-lite: FVG shadow observation (fetch + log, no trade)
-        self._fvg_last_status: Dict[int, str] = {}  # signal_id → last-seen status
+        # FVG shadow observation (FVG_MODE='shadow' only): transition detection
+        self._fvg_last_status: Dict[int, str] = {}
         self._fvg_primed:       bool          = False  # True after first poll absorbs initial state silently
 
         # Phase 7: daily MAX LOSS lock state. Counter accumulates across day+night
@@ -113,12 +139,6 @@ class MTXStrategy:
         self._trading_day_date:    Optional[Any]   = None  # `date` object, None until first poll
         self._trading_day_locked:  bool            = False
         self._trading_day_alert_sent: bool         = False  # one-shot Telegram on lock trigger
-
-        # Phase 6c-minimum: parallel FVG position tracker (FVG max 1 → single Optional).
-        # Set when FVG_MODE in ('paper','live') receives an 'open' signal; cleared on close.
-        # NOT in _units (no MTX path refactor needed). Shape:
-        #   {id, dir, entry, stop, target, label, opened_at}
-        self._fvg_position: Optional[Dict[str, Any]] = None
 
         # Persistent trades log + monthly P&L counters. Resets on month change (TW trading-day boundary).
         # Restored from trades.jsonl at startup so restart doesn't lose mid-month state.
@@ -130,10 +150,8 @@ class MTXStrategy:
         self._month_by_source:      Dict[str, Dict[str, Any]] = {}
 
         # Plan D: broker reconciliation safety net. Periodically (~1 min) compare
-        # broker's actual net position vs trader's expected (sum of _units MTX +
-        # _fvg_position FVG). Mismatch persisting > RECON_ALERT_AGE_SEC → Telegram
-        # alert. Catches drift like the 2026-05-16 FVG engine non-determinism bug
-        # where broker has a position but trader's _fvg_position is None.
+        # broker's actual net position vs trader's expected (sum of all _units source lists).
+        # Mismatch persisting > RECON_ALERT_AGE_SEC → Telegram alert.
         self._recon_last_check:      float                  = 0.0    # epoch s of last check
         self._recon_mismatch_since:  Optional[float]        = None   # when mismatch first observed
         self._recon_alert_sent:      bool                   = False  # one-shot dedup
@@ -143,11 +161,44 @@ class MTXStrategy:
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
 
+    # ── Helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize(raw: dict, source: str) -> dict:
+        """Coerce a raw history/signal item into a common shape.
+
+        MTX history (worker /api/history) uses `sigLabel`; FVG signals use `label`.
+        Every item gets a `source` tag and a `label` field after normalization.
+        """
+        out = dict(raw)
+        out["source"] = source
+        if source == "mtx" and "label" not in out:
+            out["label"] = raw.get("sigLabel", "")
+        return out
+
+    def _should_place_order(self, source: str) -> bool:
+        """Whether to actually hit broker for a given source.
+        MTX always does (unless dry_run); FVG only in 'live' mode."""
+        if source == "mtx":
+            return True
+        if source == "fvg":
+            return FVG_OBSERVE_MODE == "live"
+        return False
+
+    def _flatten_units(self) -> List[Dict[str, Any]]:
+        """Snapshot all units across all sources, for cross-source visibility
+        (heartbeat, reconciliation, disconnect notifications)."""
+        out: List[Dict[str, Any]] = []
+        for src_units in self._units.values():
+            out.extend(src_units)
+        return out
+
     # ── 啟動 / 停止 ──────────────────────────────────────────────
 
     def start(self):
+        # MTX startup restore — pulls open positions from Worker KV history
         try:
-            history = self._fetch_history()
+            history = self._fetch_history(HISTORY_URL)
             if history:
                 # Only restore trades opened in the current trading session
                 # (avoids ghost "trail" entries from previous sessions in Worker KV)
@@ -169,16 +220,18 @@ class MTXStrategy:
                     key=lambda t: t["id"]
                 )
                 if open_trades:
-                    for trade in open_trades[:MAX_UNITS]:
-                        logger.info(f"Startup: restoring state id={trade['id']} dir={trade['dir']} (no order placed)")
-                        self._open_unit(trade, notify=False, place_order=False)
-                    self._last_seen_id = open_trades[-1]["id"]
-                    logger.info(f"Startup: {len(self._units)} unit(s) state restored")
+                    mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
+                    for trade in open_trades[:mtx_cap]:
+                        trade = self._normalize(trade, "mtx")
+                        logger.info(f"Startup: restoring MTX state id={trade['id']} dir={trade['dir']} (no order placed)")
+                        self._open_unit(trade, source="mtx", notify=False, place_order=False)
+                    self._last_seen_id["mtx"] = open_trades[-1]["id"]
+                    logger.info(f"Startup: {len(self._units['mtx'])} MTX unit(s) state restored")
                 else:
-                    self._last_seen_id = history[0]["id"]
-                    logger.info(f"Startup: no current-session open trades, last id={self._last_seen_id}")
+                    self._last_seen_id["mtx"] = history[0]["id"]
+                    logger.info(f"Startup: no current-session MTX open trades, last id={self._last_seen_id['mtx']}")
         except Exception as e:
-            logger.warning(f"Startup fetch failed: {e}")
+            logger.warning(f"Startup MTX fetch failed: {e}")
 
         now = datetime.now(TZ_TW)
         self._current_session = _get_session(now)
@@ -186,13 +239,14 @@ class MTXStrategy:
 
         # Restore current-month P&L counters from trades.jsonl (so restart preserves state)
         self._restore_month_from_log()
-        # Restore FVG position from disk (so trader restart doesn't lose track of an open FVG trade)
+        # Restore FVG units from disk (so trader restart doesn't lose track of an open FVG trade)
         self._load_fvg_state()
 
         self._running = True
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
-        logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s")
+        logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s | "
+                    f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE}")
 
     def stop(self):
         self._running = False
@@ -201,25 +255,27 @@ class MTXStrategy:
 
     def on_disconnect(self):
         with self._lock:
-            units = list(self._units)
+            units = self._flatten_units()
         logger.warning(f"Disconnected | local units={len(units)}")
         if units:
             pos_desc = ", ".join(
-                f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}" for u in units
+                f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}[{u.get('source','?').upper()}]" for u in units
             )
             dry_tag = " [模擬]" if self.dry_run else ""
             threading.Thread(target=self._safe_notify, args=(
                 f"⚠️ <b>斷線警告{dry_tag}</b>\n"
-                f"本地倉位：{pos_desc}\n正在等待重連...",
+                f"本地倉位:{pos_desc}\n正在等待重連...",
             ), daemon=True).start()
 
     def on_reconnect(self, broker_pos: Optional[dict] = None):
         with self._lock:
-            units = list(self._units)
+            units = self._flatten_units()
 
         dry_tag   = " [模擬]" if self.dry_run else ""
-        local_dir = units[0]["dir"] if units else None
-        logger.warning(f"Reconnected | local_units={len(units)} | broker={broker_pos}")
+        # Use net direction across all sources for mismatch check (signed net = #long − #short)
+        net = sum(1 if u["dir"] == "long" else -1 for u in units)
+        local_dir = "long" if net > 0 else ("short" if net < 0 else None)
+        logger.warning(f"Reconnected | local_units={len(units)} net={net} | broker={broker_pos}")
 
         if broker_pos:
             broker_dir = "long" if broker_pos.get("bs") == "B" else "short"
@@ -232,14 +288,14 @@ class MTXStrategy:
             l_zh = "多" if local_dir == "long" else ("空" if local_dir == "short" else "無")
             threading.Thread(target=self._safe_notify, args=(
                 f"🚨 <b>重連倉位不一致{dry_tag}</b>\n"
-                f"本地：{l_zh}（{len(units)}口）\n券商：{b_zh}\n請立即手動確認！",
+                f"本地:{l_zh}(net={net})\n券商:{b_zh}\n請立即手動確認!",
             ), daemon=True).start()
         elif units:
             pos_desc = ", ".join(
-                f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}" for u in units
+                f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}[{u.get('source','?').upper()}]" for u in units
             )
             threading.Thread(target=self._safe_notify, args=(
-                f"✅ <b>重連成功{dry_tag}</b>\n倉位確認：{pos_desc}（券商一致）",
+                f"✅ <b>重連成功{dry_tag}</b>\n倉位確認:{pos_desc}(券商一致)",
             ), daemon=True).start()
         else:
             logger.info("Reconnect: no open position, no action needed")
@@ -248,9 +304,10 @@ class MTXStrategy:
 
     def on_tick(self, price: float):
         with self._lock:
-            if not self._units:
+            all_units = self._flatten_units()
+            if not all_units:
                 return
-            for unit in list(self._units):
+            for unit in all_units:
                 self._check_exit_unit(unit, price)
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
@@ -265,18 +322,36 @@ class MTXStrategy:
                 self._check_session_change()
                 self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
                 if not is_weekend:
-                    history = self._fetch_history()
-                    self._sync_worker_state(history)  # ① sync exits first — clears closed positions
-                    self._check_new_signal(history)   # ② then pick up new signals with fresh state
+                    for src_info in SIGNAL_SOURCES:
+                        source = src_info["source"]
+                        # FVG can be turned off globally via env
+                        if source == "fvg" and FVG_OBSERVE_MODE == "off":
+                            continue
+                        try:
+                            raw = self._fetch_history(src_info["url"])
+                        except Exception as e:
+                            # MTX failure is loud (trader core), FVG failure is quiet
+                            if source == "mtx":
+                                logger.error(f"MTX history fetch error: {e}")
+                            else:
+                                logger.debug(f"FVG signals fetch error (silent): {e}")
+                            continue
+                        history = [self._normalize(t, source) for t in raw if isinstance(t, dict)]
+                        # Shadow mode: observation-only path for FVG (no _units update, no broker)
+                        if source == "fvg" and FVG_OBSERVE_MODE == "shadow":
+                            self._observe_fvg_signals(history)
+                            continue
+                        try:
+                            self._sync_worker_state(history, source)  # ① sync exits first — clears closed positions
+                            self._check_new_signal(history, source)   # ② then pick up new signals with fresh state
+                        except Exception as e:
+                            # FVG errors must never break MTX; MTX errors loud
+                            if source == "mtx":
+                                logger.error(f"MTX signal handling error: {e}")
+                            else:
+                                logger.debug(f"FVG signal handling error (silent): {e}")
             except Exception as e:
                 logger.error(f"Poll error: {e}")
-            # Phase 6a-lite: FVG shadow observation (separate try/except so MTX path is never
-            # affected by FVG side issues — shadow is observational only, must never break trader).
-            try:
-                if not is_weekend:
-                    self._observe_fvg_signals(self._fetch_fvg_signals())
-            except Exception as e:
-                logger.debug(f"FVG observe error (silent): {e}")
             # Plan D: broker reconciliation safety net (throttled to ~1 min via internal check)
             try:
                 self._check_broker_reconciliation()
@@ -284,16 +359,22 @@ class MTXStrategy:
                 logger.debug(f"recon error (silent): {e}")
             # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
             # errors (watchdog needs to see "process alive but polls failing" as a signal).
+            mtx_units = self._units.get("mtx", [])
+            fvg_units = self._units.get("fvg", [])
             heartbeat.send({
                 "ts":                  int(time.time() * 1000),
                 "pid":                 os.getpid(),
                 "session":             self._current_session,
-                "units":               len(self._units),
-                "last_seen_id":        self._last_seen_id,
+                "units":               len(mtx_units) + len(fvg_units),  # back-compat total
+                "units_mtx":           len(mtx_units),
+                "units_fvg":           len(fvg_units),
+                "last_seen_id":        self._last_seen_id.get("mtx"),    # back-compat = MTX cursor
+                "last_seen_id_mtx":    self._last_seen_id.get("mtx"),
+                "last_seen_id_fvg":    self._last_seen_id.get("fvg"),
                 "trading_day_pnl_pts": self._trading_day_pnl_pts,
                 "trading_day_locked":  self._trading_day_locked,
                 "fvg_mode":            FVG_OBSERVE_MODE,
-                "fvg_position_id":     self._fvg_position.get("id") if self._fvg_position else None,
+                "fvg_position_id":     fvg_units[0].get("id") if fvg_units else None,
                 "month":               self._current_month,
                 "month_pnl_pts":       self._month_pnl_pts,
                 "month_trades_count":  self._month_trades_count,
@@ -325,7 +406,7 @@ class MTXStrategy:
                        stop, target, pnl_pts: float, reason: str, sig_id, opened_at_ms):
         """Append one trade record to trades.jsonl AND update monthly counters.
 
-        Called from _close_unit (MTX) and _fvg_handle_trade (FVG close branch).
+        Called from _close_unit for every closed unit regardless of source.
         Wraps file I/O + counter math in try/except so failures don't break trading.
         """
         try:
@@ -353,7 +434,7 @@ class MTXStrategy:
             }
             with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            # Cloud backup (Worker /api/trade_log,Worker 端 dedup by (id, reason))
+            # Cloud backup (Worker /api/trade_log, Worker 端 dedup by (id, reason))
             trade_log_emit.send(record)
         except Exception as e:
             logger.error(f"trades.jsonl write failed: {e}")
@@ -456,31 +537,44 @@ class MTXStrategy:
             logger.warning(f"Monthly restore failed (continuing with 0s): {e}")
 
     def _load_fvg_state(self) -> None:
-        """Restore _fvg_position from disk (Plan A trader-side companion).
+        """Restore _units['fvg'] from disk (Plan A trader-side companion).
 
-        Trader restart used to drop _fvg_position → broker FVG positions
+        Trader restart used to drop the FVG position → broker FVG positions
         becoming untracked. With this, restart restores trader's view
         and Plan D recon still validates against broker reality.
+
+        Backwards compat: old schema `{"fvg_position": <single dict or null>}`
+        is migrated transparently to `{"fvg_units": [<list>]}` on next save.
         """
         if not FVG_STATE_PATH.exists():
             return
         try:
             data = json.loads(FVG_STATE_PATH.read_text())
-            self._fvg_position = data.get("fvg_position")  # dict or None
-            if self._fvg_position:
-                logger.info(
-                    f"FVG state restored: id={self._fvg_position.get('id')} "
-                    f"dir={self._fvg_position.get('dir')} entry={self._fvg_position.get('entry')}"
-                )
+            # New schema
+            units = data.get("fvg_units")
+            if units is None:
+                # Legacy schema migration
+                legacy_pos = data.get("fvg_position")
+                units = [legacy_pos] if legacy_pos else []
+            if units:
+                # Ensure each restored unit has a 'source' tag for downstream branches
+                for u in units:
+                    if isinstance(u, dict):
+                        u.setdefault("source", "fvg")
+                        self._units["fvg"].append(u)
+                        logger.info(
+                            f"FVG state restored: id={u.get('id')} "
+                            f"dir={u.get('dir')} entry={u.get('entry')}"
+                        )
         except Exception as e:
             logger.warning(f"FVG state load failed (continuing fresh): {e}")
-            self._fvg_position = None
+            self._units["fvg"] = []
 
     def _save_fvg_state(self) -> None:
-        """Atomic write of _fvg_position to disk. Called after every mutation
-        in _fvg_handle_trade so disk reflects live state crash-safely."""
+        """Atomic write of _units['fvg'] to disk. Called after every FVG unit
+        open/close in _open_unit / _close_unit so disk reflects live state crash-safely."""
         try:
-            data = {"fvg_position": self._fvg_position}
+            data = {"fvg_units": list(self._units.get("fvg", []))}
             tmp = FVG_STATE_PATH.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False))
             tmp.replace(FVG_STATE_PATH)
@@ -488,12 +582,11 @@ class MTXStrategy:
             logger.error(f"FVG state save failed: {e}")
 
     def _expected_net_position(self) -> int:
-        """Trader's expected signed net lots = sum of MTX _units + FVG _fvg_position."""
+        """Trader's expected signed net lots = sum across all source unit lists."""
         net = 0
-        for u in self._units:
-            net += 1 if u["dir"] == "long" else -1
-        if self._fvg_position is not None:
-            net += 1 if self._fvg_position["dir"] == "long" else -1
+        for units in self._units.values():
+            for u in units:
+                net += 1 if u["dir"] == "long" else -1
         return net
 
     def _check_broker_reconciliation(self):
@@ -501,7 +594,7 @@ class MTXStrategy:
         expected net. Persistent mismatch (>3 min) → Telegram alert.
 
         Catches drift scenarios like the 2026-05-16 FVG bug where broker has
-        a position but trader's _fvg_position is None (or vice versa).
+        a position but trader's FVG units list is empty (or vice versa).
         Throttled to once per RECON_CHECK_INTERVAL_SEC (~1 min) to be API-polite.
 
         Skipped when broker API likely unreliable:
@@ -565,17 +658,22 @@ class MTXStrategy:
         logger.debug(f"recon mismatch ongoing: expected={expected_net} broker={broker_net} age={age:.0f}s")
         if age > RECON_ALERT_AGE_SEC and not self._recon_alert_sent:
             self._recon_alert_sent = True
-            # Build context for alert
-            mtx_count = len(self._units)
-            mtx_long  = sum(1 for u in self._units if u["dir"] == "long")
+            # Build per-source context for alert
+            mtx_units = self._units.get("mtx", [])
+            fvg_units = self._units.get("fvg", [])
+            mtx_count = len(mtx_units)
+            mtx_long  = sum(1 for u in mtx_units if u["dir"] == "long")
             mtx_short = mtx_count - mtx_long
-            fvg_str   = f"{self._fvg_position['dir']} (id={self._fvg_position['id']})" if self._fvg_position else "(無)"
+            if fvg_units:
+                fvg_str = ", ".join(f"{u['dir']} (id={u['id']})" for u in fvg_units)
+            else:
+                fvg_str = "(無)"
             logger.error(f"DAILY_RECON_ALERT: broker_net={broker_net} expected_net={expected_net} age={age:.0f}s")
             self._safe_notify(
                 f"⚠️ <b>Broker 對帳異常 {int(age/60)} 分鐘</b>\n"
                 f"Trader 預期: <b>{expected_net} 口</b>\n"
                 f"  MTX _units: {mtx_count} ({mtx_long} long / {mtx_short} short)\n"
-                f"  FVG _fvg_position: {fvg_str}\n"
+                f"  FVG _units: {fvg_str}\n"
                 f"Broker 實際: <b>{broker_net} 口</b>\n"
                 f"差距: <b>{broker_net - expected_net:+d} 口</b>\n"
                 f"建議:檢查是否 FVG bot engine 漏 close 訊號(見 [[feedback-fvg-engine-multi-open-bug]]),"
@@ -620,11 +718,16 @@ class MTXStrategy:
 
     # ── 新訊號偵測 ────────────────────────────────────────────────
 
-    def _check_new_signal(self, history: list):
+    def _check_new_signal(self, history: list, source: str):
+        """Scan a source's history for new 'open' signals. Source-aware:
+        - MTX: same-dir pyramid up to MAX_UNITS_PER_SOURCE['mtx']; opposite → reverse
+        - FVG: max 1 unit, defensive refusal if any unit already open
+        """
         if not history:
             return
 
-        cutoff = self._last_seen_id or 0
+        cutoff   = self._last_seen_id.get(source) or 0
+        max_cap  = MAX_UNITS_PER_SOURCE.get(source, 1)
         new_trades = sorted(
             [t for t in history if isinstance(t, dict) and t.get("id", 0) > cutoff],
             key=lambda t: t["id"]   # oldest-first
@@ -639,43 +742,60 @@ class MTXStrategy:
 
             if status != "open":
                 # Already closed before we could act — mark seen, keep scanning
-                self._last_seen_id = trade_id
+                self._last_seen_id[source] = trade_id
                 continue
 
             with self._lock:
-                cur_dir = self._units[0]["dir"] if self._units else None
-                n_units = len(self._units)
+                units_here = self._units.get(source, [])
+                cur_dir = units_here[0]["dir"] if units_here else None
+                n_units = len(units_here)
+
+            # FVG: any existing unit blocks new opens regardless of direction
+            if source == "fvg" and n_units >= max_cap:
+                logger.warning(f"FVG entry {trade_id} ignored — existing position id={units_here[0].get('id')}")
+                self._last_seen_id[source] = trade_id
+                continue
 
             if cur_dir == direction:
-                if n_units >= MAX_UNITS:
+                if n_units >= max_cap:
                     # At max units, same direction: Worker ignores too
-                    logger.info(f"Max units ({MAX_UNITS}), same-direction ignore | id={trade_id}")
-                    self._last_seen_id = trade_id
+                    logger.info(f"Max units ({max_cap}), same-direction ignore | source={source} id={trade_id}")
+                    self._last_seen_id[source] = trade_id
                     continue
                 else:
-                    # Pyramid: Worker already verified canPyramid conditions
-                    logger.info(f"Pyramid | unit {n_units + 1}/{MAX_UNITS} | id={trade_id}")
-                    self._last_seen_id = trade_id
-                    self._add_unit(trade)
+                    # Pyramid (MTX only — FVG has max=1 so already returned above)
+                    logger.info(f"Pyramid | source={source} unit {n_units + 1}/{max_cap} | id={trade_id}")
+                    self._last_seen_id[source] = trade_id
+                    self._add_unit(trade, source)
                     return
             else:
                 # No position, or reversal
-                self._last_seen_id = trade_id
-                self._enter(trade)
+                self._last_seen_id[source] = trade_id
+                self._enter(trade, source)
                 return
 
-    # ── Worker 狀態同步（每口獨立）────────────────────────────────
+    # ── Worker 狀態同步(每口獨立)────────────────────────────────
 
-    def _sync_worker_state(self, history: list):
+    def _sync_worker_state(self, history: list, source: str):
+        """Sync local source units against the authoritative source history.
+        Closes units whose corresponding history record now has a terminal status.
+
+        Status handling:
+          loss        → close with reason="loss"  (MTX + FVG)
+          profit      → close with reason="profit" (MTX + FVG)
+          trail       → close with reason="trail"  (MTX only — FVG doesn't emit)
+          reversed    → close with reason="reversed" or "replaced" (MTX only)
+          session_end → close with reason="session_end" (FVG only)
+          open + new stop → update unit's stop (trailing-stop sync)
+        """
         with self._lock:
-            if not self._units:
+            units_here = self._units.get(source, [])
+            if not units_here:
                 return
-            units_snapshot = list(self._units)
+            units_snapshot = list(units_here)
 
         for unit in units_snapshot:
-            # Scan full history (Worker keeps up to 50 entries) — earlier slice [:20]
-            # silently abandoned units that fell off the front, leaving stale local state
-            # that later got reversed at far-away prices, producing huge phantom P&L.
+            # Scan full history — Worker keeps up to 50 entries
             our_trade = next((t for t in history if t.get("id") == unit["id"]), None)
             if our_trade is None:
                 continue
@@ -684,27 +804,30 @@ class MTXStrategy:
             new_stop = our_trade.get("stop")
 
             with self._lock:
-                if unit not in self._units:
+                if unit not in self._units.get(source, []):
                     continue  # closed during this iteration
 
                 if status == "loss":
                     pnl        = our_trade.get("pnl") or 0
                     exit_price = (our_trade["entry"] + pnl) if unit["dir"] == "long" \
                                  else (our_trade["entry"] - pnl)
-                    logger.info(f"Worker exit (loss) | id={unit['id']}")
+                    logger.info(f"Worker exit (loss) | source={source} id={unit['id']}")
                     self._close_unit(unit, "loss", exit_price=exit_price)
 
                 elif status == "profit":
                     exit_price = our_trade.get("target")
-                    logger.info(f"Worker exit (profit) | id={unit['id']}")
+                    # FVG signals carry the actual exit price in meta when available
+                    meta_exit = (our_trade.get("meta") or {}).get("exit_price")
+                    if meta_exit is not None:
+                        exit_price = meta_exit
+                    logger.info(f"Worker exit (profit) | source={source} id={unit['id']}")
                     self._close_unit(unit, "profit", exit_price=exit_price)
 
                 elif status == "trail":
                     # Worker (worker/index.js:782/785) writes status='trail' when trailing stop hits.
                     # Use the trail-stop level as exit_price; Worker's t.pnl already reflects locked profit.
-                    pnl        = our_trade.get("pnl") or 0
                     exit_price = our_trade.get("stop")
-                    logger.info(f"Worker exit (trail) | id={unit['id']}")
+                    logger.info(f"Worker exit (trail) | source={source} id={unit['id']}")
                     self._close_unit(unit, "trail", exit_price=exit_price)
 
                 elif status == "reversed":
@@ -724,56 +847,70 @@ class MTXStrategy:
                     )
                     same_dir = bool(triggering and triggering.get("dir") == unit["dir"])
                     reason   = "replaced" if same_dir else "reversed"
-                    logger.info(f"Worker exit ({reason}) | id={unit['id']}")
+                    logger.info(f"Worker exit ({reason}) | source={source} id={unit['id']}")
                     self._close_unit(unit, reason, exit_price=exit_price)
 
+                elif status == "session_end":
+                    # FVG-specific: engine force-exits open positions at session end
+                    meta_exit = (our_trade.get("meta") or {}).get("exit_price")
+                    exit_price = meta_exit if meta_exit is not None else our_trade.get("entry")
+                    logger.info(f"Worker exit (session_end) | source={source} id={unit['id']}")
+                    self._close_unit(unit, "session_end", exit_price=exit_price)
+
                 elif status in ("open", "trail") and new_stop and new_stop != unit["stop"]:
-                    logger.info(f"Trailing stop synced | {unit['stop']} → {new_stop} | id={unit['id']}")
+                    logger.info(f"Trailing stop synced | source={source} {unit['stop']} → {new_stop} | id={unit['id']}")
                     unit["stop"] = new_stop
 
-    # ── 進場（反向或首口）────────────────────────────────────────
+    # ── 進場(反向或首口)────────────────────────────────────────
 
-    def _enter(self, trade: dict):
+    def _enter(self, trade: dict, source: str):
         direction = trade.get("dir")
         entry     = trade.get("entry")
 
         with self._lock:
-            for unit in list(self._units):
+            for unit in list(self._units.get(source, [])):
                 if unit["dir"] != direction:
                     self._close_unit(unit, "reversed", exit_price=entry)
-            if self._units:
+            if self._units.get(source):
                 return  # unexpected same-direction units still open
-            self._open_unit(trade)
+            self._open_unit(trade, source)
 
-    # ── 加碼（第 2 口）────────────────────────────────────────────
+    # ── 加碼(第 2 口)────────────────────────────────────────────
 
-    def _add_unit(self, trade: dict):
+    def _add_unit(self, trade: dict, source: str):
+        max_cap = MAX_UNITS_PER_SOURCE.get(source, 1)
         with self._lock:
-            if not self._units or len(self._units) >= MAX_UNITS:
+            units_here = self._units.get(source, [])
+            if not units_here or len(units_here) >= max_cap:
                 return
-            # Lock first unit stop to entry ± PYRAMID_LOCK
-            first = self._units[0]
-            if first["dir"] == "long":
-                first["stop"] = max(first["stop"] or 0, first["entry"] + PYRAMID_LOCK)
-            else:
-                first["stop"] = min(first["stop"] or 999999, first["entry"] - PYRAMID_LOCK)
-            logger.info(f"First unit stop locked → {first['stop']}")
-            self._open_unit(trade, is_pyramid=True)
+            # Lock first unit stop to entry ± PYRAMID_LOCK (MTX-style pyramid only)
+            if source == "mtx":
+                first = units_here[0]
+                if first["dir"] == "long":
+                    first["stop"] = max(first["stop"] or 0, first["entry"] + PYRAMID_LOCK)
+                else:
+                    first["stop"] = min(first["stop"] or 999999, first["entry"] - PYRAMID_LOCK)
+                logger.info(f"First MTX unit stop locked → {first['stop']}")
+            self._open_unit(trade, source, is_pyramid=True)
 
     # ── 開倉執行 ──────────────────────────────────────────────────
 
-    def _open_unit(self, trade: dict, is_pyramid: bool = False, notify: bool = True,
-                   place_order: bool = True):
-        # Call within lock (or at startup before threads start)
+    def _open_unit(self, trade: dict, source: str, is_pyramid: bool = False, notify: bool = True,
+                   place_order: Optional[bool] = None):
+        # Call within lock (or at startup before threads start).
+        # place_order=None → decide from source/mode via _should_place_order.
+        # Caller can force place_order=False (e.g. startup restore).
         direction = trade.get("dir")
         product   = self.trader.config["product"]
+        if place_order is None:
+            place_order = self._should_place_order(source)
 
         # Phase 7: daily MAX LOSS gate. Only blocks real broker calls; startup state
         # restore (place_order=False) is always allowed so locked positions resume tracking.
         if place_order and self._trading_day_locked:
             label = "加碼" if is_pyramid else "進場"
-            logger.warning(f"Daily MAX LOSS lock active — refusing {label} signal id={trade.get('id')}")
-            # No Telegram on each rejection (would spam); the original lock-trigger msg is enough
+            logger.warning(f"Daily MAX LOSS lock active — refusing {source} {label} signal id={trade.get('id')}")
+            # No Telegram per rejection (would spam); original lock-trigger msg is enough
             return
 
         if place_order:
@@ -786,64 +923,77 @@ class MTXStrategy:
                 return
 
         unit = {
+            "source":    source,
             "id":        trade["id"],
             "dir":       direction,
             "entry":     trade.get("entry"),
             "stop":      trade.get("stop"),
             "target":    trade.get("target"),
-            "sig_label": trade.get("sigLabel", ""),
+            "sig_label": trade.get("label") or trade.get("sigLabel", ""),
             "opened_at": int(time.time() * 1000),  # epoch ms, for trade duration calc
         }
-        self._units.append(unit)
-        logger.info(f"Unit {len(self._units)} opened | {direction} entry={unit['entry']} stop={unit['stop']}")
+        self._units.setdefault(source, []).append(unit)
+        logger.info(f"{source.upper()} Unit {len(self._units[source])} opened | "
+                    f"{direction} entry={unit['entry']} stop={unit['stop']}")
+
+        # Persist FVG units to disk (MTX is recoverable from Worker KV)
+        if source == "fvg":
+            self._save_fvg_state()
 
         if not notify:
             return
 
         emoji   = ENTRY_EMOJI.get(direction, "📌")
+        tag     = SOURCE_TAG.get(source, "")
         dry_tag = " [模擬]" if self.dry_run else ""
-        suffix  = "（加碼）" if is_pyramid else ""
+        if not place_order and source == "fvg" and FVG_OBSERVE_MODE == "paper":
+            dry_tag = " [PAPER]"
+        suffix  = "(加碼)" if is_pyramid else ""
         text = (
-            f"{emoji} <b>進場{dry_tag}{suffix}</b>\n"
-            f"信號：{unit['sig_label']}\n"
-            f"方向：{'多' if direction == 'long' else '空'}\n"
-            f"進場：{unit['entry']}　停損：{unit['stop']}　停利：{unit['target']}"
+            f"{emoji} <b>{tag}進場{dry_tag}{suffix}</b>\n"
+            f"信號:{unit['sig_label']}\n"
+            f"方向:{'多' if direction == 'long' else '空'}\n"
+            f"進場:{unit['entry']}　停損:{unit['stop']}　停利:{unit['target']}"
         )
         threading.Thread(target=self._safe_notify, args=(text,), daemon=True).start()
 
-    # ── tick-level 出場檢查（每口獨立）────────────────────────────
+    # ── tick-level 出場檢查(每口獨立)────────────────────────────
 
     def _check_exit_unit(self, unit: dict, price: float):
         # Call within lock
-        if unit not in self._units:
+        source = unit.get("source", "mtx")
+        if unit not in self._units.get(source, []):
             return
         if unit["dir"] == "long":
             if unit["stop"] and price <= unit["stop"]:
-                logger.info(f"Stop hit | id={unit['id']} price={price} stop={unit['stop']}")
+                logger.info(f"Stop hit | source={source} id={unit['id']} price={price} stop={unit['stop']}")
                 self._close_unit(unit, "loss", exit_price=price)
             elif unit["target"] and price >= unit["target"]:
-                logger.info(f"Target hit | id={unit['id']} price={price} target={unit['target']}")
+                logger.info(f"Target hit | source={source} id={unit['id']} price={price} target={unit['target']}")
                 self._close_unit(unit, "profit", exit_price=price)
         elif unit["dir"] == "short":
             if unit["stop"] and price >= unit["stop"]:
-                logger.info(f"Stop hit | id={unit['id']} price={price} stop={unit['stop']}")
+                logger.info(f"Stop hit | source={source} id={unit['id']} price={price} stop={unit['stop']}")
                 self._close_unit(unit, "loss", exit_price=price)
             elif unit["target"] and price <= unit["target"]:
-                logger.info(f"Target hit | id={unit['id']} price={price} target={unit['target']}")
+                logger.info(f"Target hit | source={source} id={unit['id']} price={price} target={unit['target']}")
                 self._close_unit(unit, "profit", exit_price=price)
 
-    # ── 平倉執行（單口）──────────────────────────────────────────
+    # ── 平倉執行(單口)──────────────────────────────────────────
 
     def _close_unit(self, unit: dict, reason: str, exit_price=None):
         # Call within lock
-        if unit not in self._units:
+        source = unit.get("source", "mtx")
+        if unit not in self._units.get(source, []):
             return
 
+        place_order = self._should_place_order(source)
         product = self.trader.config["product"]
-        if unit["dir"] == "long":
-            self._execute_order("SELL", product, 1, opencloseflag="1")
-        else:
-            self._execute_order("BUY", product, 1, opencloseflag="1")
+        if place_order:
+            if unit["dir"] == "long":
+                self._execute_order("SELL", product, 1, opencloseflag="1")
+            else:
+                self._execute_order("BUY", product, 1, opencloseflag="1")
 
         pnl_pts = 0
         if exit_price and unit["entry"]:
@@ -851,10 +1001,11 @@ class MTXStrategy:
                       else (unit["entry"] - exit_price)
         pnl_ntd = int(pnl_pts * POINT_VALUE)
 
-        logger.info(f"Unit closed | reason={reason} dir={unit['dir']} "
+        logger.info(f"{source.upper()} Unit closed | reason={reason} dir={unit['dir']} "
                     f"entry={unit['entry']} exit={exit_price} pnl={pnl_pts:+.0f}pts")
 
         self._session_trades.append({
+            "source":    source,
             "label":     unit["sig_label"],
             "direction": unit["dir"],
             "entry":     unit["entry"],
@@ -864,12 +1015,13 @@ class MTXStrategy:
         })
         # Persistent trade log + monthly counters (跨 restart 持久化)
         self._record_trade(
-            source="mtx", label=unit["sig_label"], dir_=unit["dir"],
+            source=source, label=unit["sig_label"], dir_=unit["dir"],
             entry=unit["entry"], exit_price=exit_price, stop=unit["stop"],
             target=unit["target"], pnl_pts=pnl_pts, reason=reason,
             sig_id=unit["id"], opened_at_ms=unit.get("opened_at"),
         )
-        # Phase 7: accumulate into trading-day P&L counter (persists across session changes)
+        # Phase 7: accumulate into trading-day P&L counter (persists across session changes).
+        # Paper-mode FVG closes still count — paper outcomes inform whether to keep going.
         self._trading_day_pnl_pts += pnl_pts
         if (DAILY_MAX_LOSS_PTS is not None
                 and not self._trading_day_locked
@@ -886,21 +1038,28 @@ class MTXStrategy:
                     f"既有持倉依自然 SL/TP/反向繼續\n"
                     f"重置時間:明早 08:45 TW"
                 )
-        self._units.remove(unit)
+        self._units[source].remove(unit)
+
+        # Persist FVG state after change (MTX is recoverable from Worker KV)
+        if source == "fvg":
+            self._save_fvg_state()
 
         emoji     = EXIT_EMOJI.get(reason, "⏹")
+        tag       = SOURCE_TAG.get(source, "")
         reason_zh = {"profit": "停利出場", "loss": "停損出場",
                      "reversed": "反向平倉", "replaced": "汰換平倉",
-                     "trail": "移動停利"}.get(reason, reason)
+                     "trail": "移動停利", "session_end": "盤末平倉"}.get(reason, reason)
         dry_tag   = " [模擬]" if self.dry_run else ""
+        if not place_order and source == "fvg" and FVG_OBSERVE_MODE == "paper":
+            dry_tag = " [PAPER]"
         pnl_sign  = "+" if pnl_pts >= 0 else ""
-        pnl_line  = (f"損益：<b>{pnl_sign}{pnl_pts:.0f} pts（{pnl_sign}NT${pnl_ntd:,}）</b>"
+        pnl_line  = (f"損益:<b>{pnl_sign}{pnl_pts:.0f} pts({pnl_sign}NT${pnl_ntd:,})</b>"
                      if exit_price else "")
         text = (
-            f"{emoji} <b>出場{dry_tag}</b>\n"
-            f"原因：{reason_zh}\n"
-            f"方向：{'多' if unit['dir'] == 'long' else '空'}\n"
-            f"進場：{unit['entry']}　出場：{exit_price}\n"
+            f"{emoji} <b>{tag}出場{dry_tag}</b>\n"
+            f"原因:{reason_zh}\n"
+            f"方向:{'多' if unit['dir'] == 'long' else '空'}\n"
+            f"進場:{unit['entry']}　出場:{exit_price}\n"
             + pnl_line
         )
         threading.Thread(target=self._safe_notify, args=(text,), daemon=True).start()
@@ -925,10 +1084,25 @@ class MTXStrategy:
             icon   = EXIT_EMOJI.get(t["reason"], "⏹")
             sign   = "+" if t["pnl_pts"] >= 0 else ""
             dir_zh = "多" if t["direction"] == "long" else "空"
-            lines.append(f"{icon} {t['label']}  {dir_zh}  {sign}{t['pnl_pts']:.0f}pts")
+            src    = t.get("source", "mtx")
+            tag    = "[FVG] " if src == "fvg" else ""
+            lines.append(f"{icon} {tag}{t['label']}  {dir_zh}  {sign}{t['pnl_pts']:.0f}pts")
         lines.append("─" * 22)
-        lines.append(f"筆數：{len(trades)}（勝{wins} 敗{losses}）")
-        lines.append(f"合計：<b>{total_sign}{total_pts:.0f} pts（{total_sign}NT${total_ntd:,}）</b>")
+        # Per-source breakdown when multiple sources contributed
+        by_src: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            src = t.get("source", "mtx")
+            d = by_src.setdefault(src, {"count": 0, "pnl": 0.0, "wins": 0, "losses": 0})
+            d["count"] += 1
+            d["pnl"]   += t["pnl_pts"]
+            if t["pnl_pts"] > 0:   d["wins"]   += 1
+            elif t["pnl_pts"] < 0: d["losses"] += 1
+        if len(by_src) > 1:
+            for src, d in by_src.items():
+                s = "+" if d["pnl"] >= 0 else ""
+                lines.append(f"{src.upper()}:{d['count']} 筆(勝{d['wins']} 敗{d['losses']}) {s}{d['pnl']:.0f}pts")
+        lines.append(f"筆數:{len(trades)}(勝{wins} 敗{losses})")
+        lines.append(f"合計:<b>{total_sign}{total_pts:.0f} pts({total_sign}NT${total_ntd:,})</b>")
 
         dry_tag = "　[模擬]" if self.dry_run else ""
         self._notify("\n".join(lines) + dry_tag)
@@ -941,30 +1115,31 @@ class MTXStrategy:
 
     def _send_open_notify(self, session: str):
         session_zh = "日盤" if session == "day" else "夜盤"
-        close_time = "13:45" if session == "day" else "05:00（+1）"
+        close_time = "13:45" if session == "day" else "05:00(+1)"
         dry_tag    = " [模擬]" if self.dry_run else ""
 
         with self._lock:
-            units = list(self._units)
+            units = self._flatten_units()
 
         if units:
             pos_lines = [
-                f"持倉：{'多' if u['dir'] == 'long' else '空'}  進場 {u['entry']}  停損 {u['stop']}  停利 {u['target']}"
+                f"持倉:{'多' if u['dir'] == 'long' else '空'}[{u.get('source','?').upper()}]"
+                f"  進場 {u['entry']}  停損 {u['stop']}  停利 {u['target']}"
                 for u in units
             ]
             pos_text = "\n".join(pos_lines)
         else:
-            pos_text = "持倉：無"
+            pos_text = "持倉:無"
 
-        lines = [f"🔔 <b>{session_zh}開盤{dry_tag}</b>", "系統：✅ 正常運作", pos_text]
+        lines = [f"🔔 <b>{session_zh}開盤{dry_tag}</b>", "系統:✅ 正常運作", pos_text]
         if self._prev_session_label:
             prev_sign = "+" if self._prev_session_pnl_pts >= 0 else ""
             prev_ntd  = int(self._prev_session_pnl_pts * POINT_VALUE)
             lines.append(
-                f"{self._prev_session_label}損益：{prev_sign}{self._prev_session_pnl_pts:.0f} pts"
-                f"（{prev_sign}NT${prev_ntd:,}）"
+                f"{self._prev_session_label}損益:{prev_sign}{self._prev_session_pnl_pts:.0f} pts"
+                f"({prev_sign}NT${prev_ntd:,})"
             )
-        lines.append(f"收盤：{close_time}")
+        lines.append(f"收盤:{close_time}")
 
         try:
             self._notify("\n".join(lines))
@@ -972,7 +1147,7 @@ class MTXStrategy:
             logger.warning(f"Open notify failed: {e}")
         logger.info(f"Open notify sent | {session_zh}")
 
-    # ── 下單（dry_run 攔截）───────────────────────────────────────
+    # ── 下單(dry_run 攔截)───────────────────────────────────────
 
     def _execute_order(self, side: str, product: str, qty: int, opencloseflag: str = ""):
         if self.dry_run:
@@ -998,36 +1173,22 @@ class MTXStrategy:
 
     # ── HTTP ─────────────────────────────────────────────────────
 
-    def _fetch_history(self) -> list:
-        resp = requests.get(HISTORY_URL, timeout=10)
+    def _fetch_history(self, url: str = HISTORY_URL) -> list:
+        """Fetch raw history/signals list from a source URL. Used for both MTX
+        history and FVG signals — same shape (list of trade-like dicts)."""
+        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         return resp.json() or []
 
-    # ── Phase 6a-lite: FVG shadow observation ─────────────────────
-    def _fetch_fvg_signals(self) -> list:
-        if FVG_OBSERVE_MODE == "off":
-            return []
-        try:
-            resp = requests.get(FVG_SIGNALS_URL, timeout=10)
-            resp.raise_for_status()
-            return resp.json() or []
-        except Exception as e:
-            logger.debug(f"FVG fetch failed (silent): {e}")
-            return []
-
+    # ── FVG_MODE='shadow' observe-only path ───────────────────────
     def _observe_fvg_signals(self, signals: list):
-        """FVG signal handling per FVG_MODE:
-          - 'off'    : skip entirely
-          - 'shadow' : log + Telegram on transitions, NO broker calls
-          - 'paper'  : also track _fvg_position locally, NO broker calls
-          - 'live'   : also place real broker orders
+        """Shadow mode: log + Telegram on (id, status) transitions, never touch
+        _units or broker. Paper/live modes go through the unified _check_new_signal
+        / _sync_worker_state path instead.
 
         First poll primes the status map silently to avoid spamming historical entries.
-        Subsequent polls notify only on (id, status) transitions.
+        Subsequent polls notify only on transitions.
         """
-        if FVG_OBSERVE_MODE not in ("shadow", "paper", "live"):
-            return
-        mode_tag = FVG_OBSERVE_MODE.upper()
         for sig in signals:
             sig_id = sig.get("id")
             status = sig.get("status", "")
@@ -1044,102 +1205,11 @@ class MTXStrategy:
             target  = sig.get("target", "?")
             pnl     = sig.get("pnl")
             pnl_str = f"  pnl={pnl:+.1f}" if isinstance(pnl, (int, float)) else ""
-            logger.info(f"FVG {mode_tag} {status} {dir_ch}@{entry} SL={stop} TP={target}{pnl_str} id={sig_id}")
+            logger.info(f"FVG SHADOW {status} {dir_ch}@{entry} SL={stop} TP={target}{pnl_str} id={sig_id}")
             self._safe_notify(
-                f"👁 <b>[FVG {mode_tag}]</b>  {status}\n"
+                f"👁 <b>[FVG SHADOW]</b>  {status}\n"
                 f"方向:{dir_ch}  進場 {entry}  停損 {stop}  停利 {target}{pnl_str}"
             )
-            # Phase 6c: paper/live modes also track local position + (live) place broker orders
-            if FVG_OBSERVE_MODE in ("paper", "live"):
-                self._fvg_handle_trade(sig)
         if not self._fvg_primed:
             self._fvg_primed = True
-            logger.info(f"FVG {mode_tag} primed: {len(self._fvg_last_status)} initial signal(s) absorbed silently")
-
-    def _fvg_handle_trade(self, sig: dict):
-        """Phase 6c-minimum: FVG position lifecycle for paper/live modes.
-
-        Maintains self._fvg_position (Optional, single position because FVG engine is
-        single-position state machine). For 'live' mode, also places real broker orders.
-
-        NOT integrated into self._units (MTX path is untouched). On trader restart,
-        _fvg_position is lost — known limitation, see project_signal_bus.md notes.
-        """
-        is_live  = FVG_OBSERVE_MODE == "live"
-        sig_id   = sig.get("id")
-        status   = sig.get("status", "")
-        mode_tag = "LIVE" if is_live else "PAPER"
-
-        if status == "open":
-            # Refuse if already have an open FVG position (defensive — FVG engine
-            # shouldn't emit a second open while one is alive, but trust no one)
-            if self._fvg_position is not None:
-                logger.warning(f"FVG {mode_tag} entry {sig_id} ignored — existing position id={self._fvg_position.get('id')}")
-                return
-            # Refuse if daily MAX LOSS lock is engaged (only blocks LIVE broker calls;
-            # PAPER mode still tracks for analytics)
-            if is_live and self._trading_day_locked:
-                logger.warning(f"FVG LIVE entry {sig_id} rejected — daily MAX LOSS lock active")
-                self._safe_notify(f"🛑 [FVG LIVE] 進場訊號被綁手擋下 id={sig_id}")
-                return
-            # Track + (live) place broker order
-            self._fvg_position = {
-                "id":        sig_id,
-                "dir":       sig.get("dir"),
-                "entry":     sig.get("entry"),
-                "stop":      sig.get("stop"),
-                "target":    sig.get("target"),
-                "label":     sig.get("label", "FVG"),
-                "opened_at": int(time.time() * 1000),
-            }
-            self._save_fvg_state()  # persist so trader restart doesn't lose track
-            if is_live:
-                product = self.trader.config["product"]
-                if self._fvg_position["dir"] == "long":
-                    self._execute_order("BUY", product, 1)
-                elif self._fvg_position["dir"] == "short":
-                    self._execute_order("SELL", product, 1)
-            logger.info(f"FVG {mode_tag} POSITION OPEN id={sig_id} dir={self._fvg_position['dir']} @{self._fvg_position['entry']}")
-
-        elif status in ("profit", "loss", "session_end"):
-            # Match by id (must be the position we opened)
-            if self._fvg_position is None or self._fvg_position.get("id") != sig_id:
-                logger.debug(f"FVG {mode_tag} {status} {sig_id} skipped — no matching local position")
-                return
-            # Place broker close if live
-            if is_live:
-                product = self.trader.config["product"]
-                if self._fvg_position["dir"] == "long":
-                    self._execute_order("SELL", product, 1, opencloseflag="1")
-                else:
-                    self._execute_order("BUY", product, 1, opencloseflag="1")
-            # Accumulate pnl into trading-day counter (whether paper or live —
-            # we want the daily lock to consider paper outcomes too, since paper
-            # is "what would have happened" and informs whether to keep going)
-            pnl_pts = sig.get("pnl") if isinstance(sig.get("pnl"), (int, float)) else 0
-            # Persistent trade log + monthly counters
-            exit_price = sig.get("meta", {}).get("exit_price")
-            self._record_trade(
-                source="fvg", label=self._fvg_position.get("label", "FVG"), dir_=self._fvg_position["dir"],
-                entry=self._fvg_position["entry"], exit_price=exit_price,
-                stop=self._fvg_position["stop"], target=self._fvg_position["target"],
-                pnl_pts=pnl_pts, reason=status,
-                sig_id=sig_id, opened_at_ms=self._fvg_position.get("opened_at"),
-            )
-            self._trading_day_pnl_pts += pnl_pts
-            if (DAILY_MAX_LOSS_PTS is not None
-                    and not self._trading_day_locked
-                    and self._trading_day_pnl_pts <= DAILY_MAX_LOSS_PTS):
-                self._trading_day_locked = True
-                if not self._trading_day_alert_sent:
-                    self._trading_day_alert_sent = True
-                    self._safe_notify(
-                        f"🛑 <b>每日 MAX LOSS 觸發 (via FVG)</b>\n"
-                        f"今日損益:{self._trading_day_pnl_pts:+.0f} pts (NT${int(self._trading_day_pnl_pts * POINT_VALUE):,})\n"
-                        f"門檻:{DAILY_MAX_LOSS_PTS:+.0f} pts\n"
-                        f"動作:trader 已綁手"
-                    )
-                logger.warning(f"DAILY_MAX_LOSS triggered via FVG: pnl={self._trading_day_pnl_pts:+.0f}")
-            logger.info(f"FVG {mode_tag} POSITION CLOSE id={sig_id} reason={status} pnl={pnl_pts:+.1f}pts")
-            self._fvg_position = None
-            self._save_fvg_state()  # persist cleared state
+            logger.info(f"FVG SHADOW primed: {len(self._fvg_last_status)} initial signal(s) absorbed silently")
