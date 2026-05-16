@@ -458,14 +458,19 @@ class MTXStrategy:
         a position but trader's _fvg_position is None (or vice versa).
         Throttled to once per RECON_CHECK_INTERVAL_SEC (~1 min) to be API-polite.
 
-        Skipped during break sessions: Unitrade daccount API may not return
-        positions reliably outside trading hours (observed 2026-05-16 weekend).
+        Skipped when broker API likely unreliable:
+        - Session is "break" (intraday break 13:45-15:00 or overnight 05:00-08:45)
+        - Weekend (Saturday/Sunday TW) — market fully closed, broker API may
+          return empty positions even if real positions are held.
+
         Existing mismatch state (_recon_mismatch_since) is preserved across the
         skip so when session resumes the tolerance window picks up where it
         left off — but stale state can self-reset on first match after resume.
         """
-        # Don't bother during break / unknown sessions
+        # Don't bother during break / unknown sessions or weekends
         if self._current_session not in ("day", "night"):
+            return
+        if datetime.now(TZ_TW).weekday() >= 5:  # 5=Saturday, 6=Sunday
             return
 
         now = time.time()
