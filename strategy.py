@@ -249,18 +249,24 @@ class MTXStrategy:
 
     def _poll_loop(self):
         while self._running:
+            # Weekend filter: market closed Sat/Sun → broker unreachable, any trading
+            # logic is wasted at best, ghost-record-polluting at worst. Skip core trading
+            # paths but keep heartbeat + recon running (so watchdog stays happy).
+            is_weekend = datetime.now(TZ_TW).weekday() >= 5
             try:
                 self._check_session_change()
                 self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
-                history = self._fetch_history()
-                self._sync_worker_state(history)  # ① sync exits first — clears closed positions
-                self._check_new_signal(history)   # ② then pick up new signals with fresh state
+                if not is_weekend:
+                    history = self._fetch_history()
+                    self._sync_worker_state(history)  # ① sync exits first — clears closed positions
+                    self._check_new_signal(history)   # ② then pick up new signals with fresh state
             except Exception as e:
                 logger.error(f"Poll error: {e}")
             # Phase 6a-lite: FVG shadow observation (separate try/except so MTX path is never
             # affected by FVG side issues — shadow is observational only, must never break trader).
             try:
-                self._observe_fvg_signals(self._fetch_fvg_signals())
+                if not is_weekend:
+                    self._observe_fvg_signals(self._fetch_fvg_signals())
             except Exception as e:
                 logger.debug(f"FVG observe error (silent): {e}")
             # Plan D: broker reconciliation safety net (throttled to ~1 min via internal check)
