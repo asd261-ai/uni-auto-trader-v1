@@ -45,6 +45,12 @@ TZ_TW = timezone(timedelta(hours=8))
 TRADES_LOG_PATH      = Path(__file__).parent / "trades.jsonl"
 MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 
+# FVG live-trade position persistent state (Plan A on trader side).
+# Without this, trader restart loses _fvg_position → broker FVG positions stuck
+# without trader tracking → Plan D detects but user must manually flat.
+# With persistence, restart restores trader's view of the open FVG trade.
+FVG_STATE_PATH       = Path(__file__).parent / "fvg_state.json"
+
 # Plan D: broker reconciliation
 RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
 RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
@@ -180,6 +186,8 @@ class MTXStrategy:
 
         # Restore current-month P&L counters from trades.jsonl (so restart preserves state)
         self._restore_month_from_log()
+        # Restore FVG position from disk (so trader restart doesn't lose track of an open FVG trade)
+        self._load_fvg_state()
 
         self._running = True
         t = threading.Thread(target=self._poll_loop, daemon=True)
@@ -446,6 +454,38 @@ class MTXStrategy:
             logger.info(f"Monthly restored: month={current_month_str} pnl={self._month_pnl_pts:+.0f}pts trades={self._month_trades_count} (read {count} lines)")
         except Exception as e:
             logger.warning(f"Monthly restore failed (continuing with 0s): {e}")
+
+    def _load_fvg_state(self) -> None:
+        """Restore _fvg_position from disk (Plan A trader-side companion).
+
+        Trader restart used to drop _fvg_position → broker FVG positions
+        becoming untracked. With this, restart restores trader's view
+        and Plan D recon still validates against broker reality.
+        """
+        if not FVG_STATE_PATH.exists():
+            return
+        try:
+            data = json.loads(FVG_STATE_PATH.read_text())
+            self._fvg_position = data.get("fvg_position")  # dict or None
+            if self._fvg_position:
+                logger.info(
+                    f"FVG state restored: id={self._fvg_position.get('id')} "
+                    f"dir={self._fvg_position.get('dir')} entry={self._fvg_position.get('entry')}"
+                )
+        except Exception as e:
+            logger.warning(f"FVG state load failed (continuing fresh): {e}")
+            self._fvg_position = None
+
+    def _save_fvg_state(self) -> None:
+        """Atomic write of _fvg_position to disk. Called after every mutation
+        in _fvg_handle_trade so disk reflects live state crash-safely."""
+        try:
+            data = {"fvg_position": self._fvg_position}
+            tmp = FVG_STATE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            tmp.replace(FVG_STATE_PATH)
+        except Exception as e:
+            logger.error(f"FVG state save failed: {e}")
 
     def _expected_net_position(self) -> int:
         """Trader's expected signed net lots = sum of MTX _units + FVG _fvg_position."""
@@ -1052,6 +1092,7 @@ class MTXStrategy:
                 "label":     sig.get("label", "FVG"),
                 "opened_at": int(time.time() * 1000),
             }
+            self._save_fvg_state()  # persist so trader restart doesn't lose track
             if is_live:
                 product = self.trader.config["product"]
                 if self._fvg_position["dir"] == "long":
@@ -1101,3 +1142,4 @@ class MTXStrategy:
                 logger.warning(f"DAILY_MAX_LOSS triggered via FVG: pnl={self._trading_day_pnl_pts:+.0f}")
             logger.info(f"FVG {mode_tag} POSITION CLOSE id={sig_id} reason={status} pnl={pnl_pts:+.1f}pts")
             self._fvg_position = None
+            self._save_fvg_state()  # persist cleared state
