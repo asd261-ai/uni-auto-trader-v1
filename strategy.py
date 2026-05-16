@@ -457,7 +457,17 @@ class MTXStrategy:
         Catches drift scenarios like the 2026-05-16 FVG bug where broker has
         a position but trader's _fvg_position is None (or vice versa).
         Throttled to once per RECON_CHECK_INTERVAL_SEC (~1 min) to be API-polite.
+
+        Skipped during break sessions: Unitrade daccount API may not return
+        positions reliably outside trading hours (observed 2026-05-16 weekend).
+        Existing mismatch state (_recon_mismatch_since) is preserved across the
+        skip so when session resumes the tolerance window picks up where it
+        left off — but stale state can self-reset on first match after resume.
         """
+        # Don't bother during break / unknown sessions
+        if self._current_session not in ("day", "night"):
+            return
+
         now = time.time()
         if now - self._recon_last_check < RECON_CHECK_INTERVAL_SEC:
             return
