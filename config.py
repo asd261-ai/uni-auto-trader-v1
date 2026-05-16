@@ -12,4 +12,8 @@ CONFIG = {
     "product": os.getenv("UNITRADE_PRODUCT", "MXFG5"),
     "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    # Health bot for server/disconnect/reconciliation/MAX-LOSS alerts.
+    # Falls back to the trading bot if unset (handled in strategy.py).
+    "health_telegram_token": os.getenv("HEALTH_TELEGRAM_BOT_TOKEN", ""),
+    "health_telegram_chat_id": os.getenv("HEALTH_TELEGRAM_CHAT_ID", ""),
 }

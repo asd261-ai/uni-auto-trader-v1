@@ -110,6 +110,11 @@ class MTXStrategy:
         self.dry_run   = dry_run
         self._tg_token = trader.config.get("telegram_token", "")
         self._tg_chat  = trader.config.get("telegram_chat_id", "")
+        # Server/disconnect/reconciliation/MAX-LOSS alerts route to the Health bot.
+        # Fall back to the trading bot so a missing-secret deploy doesn't silently
+        # drop a server alert.
+        self._tg_health_token = trader.config.get("health_telegram_token", "") or self._tg_token
+        self._tg_health_chat  = trader.config.get("health_telegram_chat_id", "") or self._tg_chat
 
         self._lock = threading.Lock()
 
@@ -266,7 +271,7 @@ class MTXStrategy:
                 f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}[{u.get('source','?').upper()}]" for u in units
             )
             dry_tag = " [模擬]" if self.dry_run else ""
-            threading.Thread(target=self._safe_notify, args=(
+            threading.Thread(target=self._safe_health_notify, args=(
                 f"⚠️ <b>斷線警告{dry_tag}</b>\n"
                 f"本地倉位:{pos_desc}\n正在等待重連...",
             ), daemon=True).start()
@@ -295,7 +300,7 @@ class MTXStrategy:
         if mismatch:
             b_zh = "多" if broker_dir == "long" else "空"
             l_zh = "多" if local_dir == "long" else ("空" if local_dir == "short" else "無")
-            threading.Thread(target=self._safe_notify, args=(
+            threading.Thread(target=self._safe_health_notify, args=(
                 f"🚨 <b>重連倉位不一致{dry_tag}</b>\n"
                 f"本地:{l_zh}(net={net})\n券商:{b_zh}\n請立即手動確認!",
             ), daemon=True).start()
@@ -303,7 +308,7 @@ class MTXStrategy:
             pos_desc = ", ".join(
                 f"{'多' if u['dir'] == 'long' else '空'}@{u['entry']}[{u.get('source','?').upper()}]" for u in units
             )
-            threading.Thread(target=self._safe_notify, args=(
+            threading.Thread(target=self._safe_health_notify, args=(
                 f"✅ <b>重連成功{dry_tag}</b>\n倉位確認:{pos_desc}(券商一致)",
             ), daemon=True).start()
         else:
@@ -648,7 +653,7 @@ class MTXStrategy:
             # Aligned — clear any prior mismatch state, notify recovery if alerted
             if self._recon_alert_sent:
                 logger.info(f"Broker recon recovered: net={broker_net}")
-                self._safe_notify(
+                self._safe_health_notify(
                     f"✅ <b>Broker 對帳已恢復</b>\n"
                     f"目前 net = {broker_net} 口\n"
                     f"(trader 視角 {expected_net} 口,broker {broker_net} 口,一致)"
@@ -678,7 +683,7 @@ class MTXStrategy:
             else:
                 fvg_str = "(無)"
             logger.error(f"DAILY_RECON_ALERT: broker_net={broker_net} expected_net={expected_net} age={age:.0f}s")
-            self._safe_notify(
+            self._safe_health_notify(
                 f"⚠️ <b>Broker 對帳異常 {int(age/60)} 分鐘</b>\n"
                 f"Trader 預期: <b>{expected_net} 口</b>\n"
                 f"  MTX _units: {mtx_count} ({mtx_long} long / {mtx_short} short)\n"
@@ -712,7 +717,7 @@ class MTXStrategy:
         self._trading_day_alert_sent  = False
         logger.info(f"Trading day reset → {today} (prev_pnl={prev_pnl:+.0f}pts was_locked={was_locked})")
         if DAILY_MAX_LOSS_PTS is not None or was_locked:
-            self._safe_notify(
+            self._safe_health_notify(
                 f"🌅 <b>Trading Day Reset</b>\n"
                 f"日期:{today}\n"
                 f"前日損益:{prev_pnl:+.0f} pts\n"
@@ -1039,7 +1044,7 @@ class MTXStrategy:
             logger.warning(f"DAILY_MAX_LOSS triggered: pnl={self._trading_day_pnl_pts:+.0f} ≤ {DAILY_MAX_LOSS_PTS:+.0f}")
             if not self._trading_day_alert_sent:
                 self._trading_day_alert_sent = True
-                self._safe_notify(
+                self._safe_health_notify(
                     f"🛑 <b>每日 MAX LOSS 觸發</b>\n"
                     f"今日損益:{self._trading_day_pnl_pts:+.0f} pts (NT${int(self._trading_day_pnl_pts * POINT_VALUE):,})\n"
                     f"門檻:{DAILY_MAX_LOSS_PTS:+.0f} pts\n"
@@ -1179,6 +1184,12 @@ class MTXStrategy:
             tg.send(self._tg_token, self._tg_chat, text)
         except Exception as e:
             logger.warning(f"Notify failed: {e}")
+
+    def _safe_health_notify(self, text: str):
+        try:
+            tg.send(self._tg_health_token, self._tg_health_chat, text)
+        except Exception as e:
+            logger.warning(f"Health notify failed: {e}")
 
     # ── HTTP ─────────────────────────────────────────────────────
 
