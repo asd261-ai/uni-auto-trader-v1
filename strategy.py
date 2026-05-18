@@ -35,6 +35,19 @@ MAX_UNITS_PER_SOURCE: Dict[str, int] = {"mtx": 2, "fvg": 1}
 #   live   : full pipeline including broker orders
 FVG_OBSERVE_MODE = os.getenv("FVG_MODE", "shadow")
 
+# Option C: 30m bias filter for FVG 5m entries. Trader queries the most recent
+# 30m signal's meta.bias_dir and only fires 5m signals whose direction aligns.
+# - bias_dir=bull → 5m long passes, 5m short absorbed
+# - bias_dir=bear → 5m short passes, 5m long absorbed
+# - bias_dir=neutral or off → no filter (pass through)
+# - bias absent (stale or never fired) → behavior depends on FVG_30M_REQUIRE_BIAS
+#   * FVG_30M_REQUIRE_BIAS=0 (default, lenient): pass through
+#   * FVG_30M_REQUIRE_BIAS=1 (strict): block
+FVG_30M_BIAS_URL       = "https://mtx-monitor.asd261-af5.workers.dev/api/signals?source=fvg_30m&limit=1"
+FVG_30M_BIAS_TTL_MIN   = int(os.getenv("FVG_30M_BIAS_TTL_MIN", "1440"))   # 24h
+FVG_30M_BIAS_CACHE_SEC = int(os.getenv("FVG_30M_BIAS_CACHE_SEC", "60"))
+FVG_30M_REQUIRE_BIAS   = os.getenv("FVG_30M_REQUIRE_BIAS", "0") == "1"
+
 POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
 PYRAMID_LOCK  = 15    # pts — first MTX unit stop locked to entry ± this on pyramid
@@ -145,6 +158,11 @@ class MTXStrategy:
         # with env FVG_BOOT_FLOOR=0.
         self._fvg_boot_ts_ms:        int  = int(time.time() * 1000)
         self._fvg_boot_floor_enabled: bool = os.getenv("FVG_BOOT_FLOOR", "1") != "0"
+
+        # Option C: 30m bias filter cache. _get_fvg_30m_bias() queries
+        # /api/signals?source=fvg_30m&limit=1 at most once per FVG_30M_BIAS_CACHE_SEC.
+        self._fvg_30m_bias_cache:     Optional[str]   = None
+        self._fvg_30m_bias_cached_at: float           = 0.0
 
         # Phase 7: daily MAX LOSS lock state. Counter accumulates across day+night
         # of the same trading day, resets at 08:45 TW (day session open).
@@ -266,7 +284,8 @@ class MTXStrategy:
         logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s | "
                     f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE} | "
                     f"fvg_boot_ts={self._fvg_boot_ts_ms} "
-                    f"(FVG opens with id<=this are silent-absorbed; floor={'on' if self._fvg_boot_floor_enabled else 'OFF'})")
+                    f"(FVG opens with id<=this are silent-absorbed; floor={'on' if self._fvg_boot_floor_enabled else 'OFF'}) | "
+                    f"30m_bias_filter=on (require={FVG_30M_REQUIRE_BIAS}, ttl={FVG_30M_BIAS_TTL_MIN}min, cache={FVG_30M_BIAS_CACHE_SEC}s)")
 
     def stop(self):
         self._running = False
@@ -745,6 +764,38 @@ class MTXStrategy:
             self._archive_and_reset_month(self._current_month, new_month)
         self._current_month = new_month
 
+    # ── 30m bias filter (Option C) ────────────────────────────────
+
+    def _get_fvg_30m_bias(self) -> Optional[str]:
+        """Return the bias_dir ('bull'/'bear'/'neutral'/'off') from the most
+        recent 30m FVG signal, or None if no signal within FVG_30M_BIAS_TTL_MIN.
+
+        Cached for FVG_30M_BIAS_CACHE_SEC to avoid per-poll fetches. On transient
+        fetch error, returns last-cached value rather than None so a network blip
+        doesn't accidentally flip the filter behavior mid-session.
+        """
+        now = time.time()
+        if now - self._fvg_30m_bias_cached_at < FVG_30M_BIAS_CACHE_SEC:
+            return self._fvg_30m_bias_cache
+        try:
+            data = self._fetch_history(FVG_30M_BIAS_URL)
+            if not data:
+                bias = None
+            else:
+                sig = data[0]
+                age_ms = (now * 1000) - sig.get("id", 0)
+                if age_ms > FVG_30M_BIAS_TTL_MIN * 60 * 1000:
+                    bias = None
+                else:
+                    bias = (sig.get("meta") or {}).get("bias_dir")
+            self._fvg_30m_bias_cache = bias
+            self._fvg_30m_bias_cached_at = now
+            return bias
+        except Exception as e:
+            logger.warning(f"30m bias fetch failed: {e} (keeping last cached={self._fvg_30m_bias_cache})")
+            self._fvg_30m_bias_cached_at = now  # rate-limit error log
+            return self._fvg_30m_bias_cache
+
     # ── 新訊號偵測 ────────────────────────────────────────────────
 
     def _check_new_signal(self, history: list, source: str):
@@ -785,6 +836,27 @@ class MTXStrategy:
                 )
                 self._last_seen_id[source] = trade_id
                 continue
+
+            # Option C: 30m bias filter for FVG 5m entries. Direction must align
+            # with the most recent 30m sidecar bias_dir.
+            if source == "fvg":
+                bias = self._get_fvg_30m_bias()
+                if bias is None:
+                    if FVG_30M_REQUIRE_BIAS:
+                        logger.info(f"FVG signal {trade_id} silent-absorbed: no 30m bias (strict mode)")
+                        self._last_seen_id[source] = trade_id
+                        continue
+                    # lenient: bias absent, fall through
+                elif bias in ("bull", "bear"):
+                    bias_long = "long" if bias == "bull" else "short"
+                    if direction != bias_long:
+                        logger.info(
+                            f"FVG signal {trade_id} silent-absorbed: dir={direction} "
+                            f"mismatches 30m bias={bias}"
+                        )
+                        self._last_seen_id[source] = trade_id
+                        continue
+                # bias in ("neutral", "off") → no directional filter, fall through
 
             with self._lock:
                 units_here = self._units.get(source, [])
