@@ -138,6 +138,14 @@ class MTXStrategy:
         self._fvg_last_status: Dict[int, str] = {}
         self._fvg_primed:       bool          = False  # True after first poll absorbs initial state silently
 
+        # FVG consumer-side boot floor: signals whose id (entry-bar timestamp in ms)
+        # is <= boot_ts are silent-absorbed in _check_new_signal to prevent phantom
+        # replay of stale KV `status=open` signals after restart. Mirrors the
+        # producer-side fix in fvg-trader/fvg/live.py (commit aef3946). Disable
+        # with env FVG_BOOT_FLOOR=0.
+        self._fvg_boot_ts_ms:        int  = int(time.time() * 1000)
+        self._fvg_boot_floor_enabled: bool = os.getenv("FVG_BOOT_FLOOR", "1") != "0"
+
         # Phase 7: daily MAX LOSS lock state. Counter accumulates across day+night
         # of the same trading day, resets at 08:45 TW (day session open).
         self._trading_day_pnl_pts: float           = 0.0
@@ -251,7 +259,9 @@ class MTXStrategy:
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
         logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s | "
-                    f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE}")
+                    f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE} | "
+                    f"fvg_boot_ts={self._fvg_boot_ts_ms} "
+                    f"(FVG opens with id<=this are silent-absorbed; floor={'on' if self._fvg_boot_floor_enabled else 'OFF'})")
 
     def stop(self):
         self._running = False
@@ -756,6 +766,18 @@ class MTXStrategy:
 
             if status != "open":
                 # Already closed before we could act — mark seen, keep scanning
+                self._last_seen_id[source] = trade_id
+                continue
+
+            # FVG consumer-side boot floor: silent-absorb stale KV `status=open`
+            # signals replayed at boot. Without this, restart re-fires any FVG
+            # signal the producer never closed (e.g. producer-crash leftovers),
+            # causing phantom Unit 1 in trader state.
+            if source == "fvg" and self._fvg_boot_floor_enabled and trade_id <= self._fvg_boot_ts_ms:
+                logger.info(
+                    f"FVG pre-boot signal {trade_id} silent-absorbed "
+                    f"(boot_ts={self._fvg_boot_ts_ms})"
+                )
                 self._last_seen_id[source] = trade_id
                 continue
 
