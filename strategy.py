@@ -84,7 +84,7 @@ RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
                "session_end": "🌙"}
-SOURCE_TAG  = {"mtx": "", "fvg": "[FVG] "}  # MTX has no prefix (default channel); FVG gets a tag
+SOURCE_TAG  = {"mtx": "[MTX] ", "fvg": "[FVG] "}  # Both sources tagged for Telegram clarity
 
 
 def _get_session(dt: datetime) -> str:
