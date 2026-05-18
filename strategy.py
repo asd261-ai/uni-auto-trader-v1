@@ -226,9 +226,14 @@ class MTXStrategy:
                     session_start = now_tw - timedelta(hours=1)  # break or unknown: conservative 1h
 
                 cutoff_ms = int(session_start.timestamp() * 1000)
+                # Only restore signals whose Worker status is still "open". Any other
+                # status (trail/loss/profit/reversed/session_end) is terminal — including
+                # "trail" here was a refactor bug that caused already-closed trades to be
+                # restored as Unit, then immediately re-closed via _sync_worker_state,
+                # double-booking pnl into trades.jsonl + monthly_summary.
                 open_trades = sorted(
                     [t for t in history if isinstance(t, dict)
-                     and t.get("status") in ("open", "trail")
+                     and t.get("status") == "open"
                      and t.get("id", 0) > cutoff_ms],
                     key=lambda t: t["id"]
                 )

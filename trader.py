@@ -110,13 +110,18 @@ class AutoTrader:
             self.strategy.on_disconnect()
 
     def _query_broker_position(self) -> dict | None:
-        """查詢券商端目前持倉，回傳 {productid, bs, qty} 或 None。"""
+        """查詢券商端目前持倉，回傳 {productid, bs, qty} 或 None。
+
+        SDK signature: daccount.get_position(actno, groupid='', trader='') -> DPositionResponse
+        DPositionResponse has fields (ok, error, data=[DPosition,...]).
+        """
         try:
-            self.api.daccount.start()
-            positions = self.api.daccount.get_position()
-            if not positions:
+            resp = self.api.daccount.get_position(self.actno)
+            if not resp or not getattr(resp, "ok", False):
+                err = getattr(resp, "error", "unknown") if resp else "no response"
+                logger.warning(f"Position query: broker not ok ({err})")
                 return None
-            # 只取 MXFG5（或設定中的 product）
+            positions = getattr(resp, "data", None) or []
             product = self.config["product"]
             for p in positions:
                 if getattr(p, "productid", "") == product:
