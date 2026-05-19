@@ -48,6 +48,23 @@ FVG_30M_BIAS_TTL_MIN   = int(os.getenv("FVG_30M_BIAS_TTL_MIN", "1440"))   # 24h
 FVG_30M_BIAS_CACHE_SEC = int(os.getenv("FVG_30M_BIAS_CACHE_SEC", "60"))
 FVG_30M_REQUIRE_BIAS   = os.getenv("FVG_30M_REQUIRE_BIAS", "0") == "1"
 
+# Regime gate for MTX long entries (manual switch — defaults OFF).
+# When enabled, blocks new MTX long entries in confirmed downtrend regime.
+# Rule: daily 20-SMA slope (over last 10 days) < 0 AND today's close < (SMA - threshold pts)
+#
+# OOS validation 2026-05-19 showed this rule does NOT generalize automatically —
+# it overfits to crash months (March 2026). Keep as MANUAL kill-switch for use
+# during clearly developing crash regimes. Sean flips on visually, off when over.
+#
+# State: reads daily_closes.json from trader dir. Populate via update_daily_close.py
+# sidecar (run after each day-session close, or cron at 13:50 TW).
+REGIME_GATE_ENABLED        = os.getenv("REGIME_GATE_DOWNTREND_BLOCK", "0") == "1"
+REGIME_GATE_SMA_DAYS       = int(os.getenv("REGIME_GATE_SMA_DAYS", "20"))
+REGIME_GATE_SLOPE_DAYS     = int(os.getenv("REGIME_GATE_SLOPE_DAYS", "10"))
+REGIME_GATE_THRESHOLD_PTS  = int(os.getenv("REGIME_GATE_THRESHOLD_PTS", "100"))
+DAILY_CLOSES_PATH          = Path(__file__).parent / "daily_closes.json"
+REGIME_CACHE_SEC           = int(os.getenv("REGIME_CACHE_SEC", "300"))  # re-read every 5 min
+
 POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
 PYRAMID_LOCK  = 15    # pts — first MTX unit stop locked to entry ± this on pyramid
@@ -163,6 +180,11 @@ class MTXStrategy:
         # /api/signals?source=fvg_30m&limit=1 at most once per FVG_30M_BIAS_CACHE_SEC.
         self._fvg_30m_bias_cache:     Optional[str]   = None
         self._fvg_30m_bias_cached_at: float           = 0.0
+
+        # Regime gate cache. _check_regime() re-reads daily_closes.json at most
+        # once per REGIME_CACHE_SEC, computes ("uptrend"/"downtrend"/"chop"/"undefined").
+        self._regime_cache:           Optional[str]   = None
+        self._regime_cached_at:       float           = 0.0
 
         # Phase 7: daily MAX LOSS lock state. Counter accumulates across day+night
         # of the same trading day, resets at 08:45 TW (day session open).
@@ -285,7 +307,10 @@ class MTXStrategy:
                     f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE} | "
                     f"fvg_boot_ts={self._fvg_boot_ts_ms} "
                     f"(FVG opens with id<=this are silent-absorbed; floor={'on' if self._fvg_boot_floor_enabled else 'OFF'}) | "
-                    f"30m_bias_filter=on (require={FVG_30M_REQUIRE_BIAS}, ttl={FVG_30M_BIAS_TTL_MIN}min, cache={FVG_30M_BIAS_CACHE_SEC}s)")
+                    f"30m_bias_filter=on (require={FVG_30M_REQUIRE_BIAS}, ttl={FVG_30M_BIAS_TTL_MIN}min, cache={FVG_30M_BIAS_CACHE_SEC}s) | "
+                    f"regime_gate={'ON' if REGIME_GATE_ENABLED else 'off'} "
+                    f"(SMA={REGIME_GATE_SMA_DAYS}d slope={REGIME_GATE_SLOPE_DAYS}d thr={REGIME_GATE_THRESHOLD_PTS}pts; "
+                    f"daily_closes={'present' if DAILY_CLOSES_PATH.exists() else 'MISSING'})")
 
     def stop(self):
         self._running = False
@@ -796,6 +821,57 @@ class MTXStrategy:
             self._fvg_30m_bias_cached_at = now  # rate-limit error log
             return self._fvg_30m_bias_cache
 
+    # ── Regime gate (manual switch) ──────────────────────────────
+
+    def _check_regime(self) -> str:
+        """Returns 'uptrend' | 'downtrend' | 'chop' | 'undefined'.
+
+        Reads daily_closes.json (list of {date, close}). Computes 20-day SMA,
+        slope over last 10 days, distance from SMA. Cached REGIME_CACHE_SEC.
+        Defensive: returns 'undefined' on any error (missing file, short history,
+        bad data). Caller must check enabled flag separately.
+        """
+        now = time.time()
+        if now - self._regime_cached_at < REGIME_CACHE_SEC:
+            return self._regime_cache or "undefined"
+        try:
+            if not DAILY_CLOSES_PATH.exists():
+                self._regime_cache = "undefined"
+                self._regime_cached_at = now
+                return "undefined"
+            with open(DAILY_CLOSES_PATH) as f:
+                data = json.load(f)
+            # Expected: [{"date": "YYYY-MM-DD", "close": 40500}, ...]
+            # Sort by date ascending, take last N where N = SMA + slope_window
+            data.sort(key=lambda x: x["date"])
+            needed = REGIME_GATE_SMA_DAYS + REGIME_GATE_SLOPE_DAYS
+            if len(data) < needed:
+                logger.debug(f"regime gate: only {len(data)} daily closes, need {needed}")
+                self._regime_cache = "undefined"
+                self._regime_cached_at = now
+                return "undefined"
+            closes = [float(d["close"]) for d in data]
+            # SMA over last N=SMA_DAYS
+            sma_now = sum(closes[-REGIME_GATE_SMA_DAYS:]) / REGIME_GATE_SMA_DAYS
+            sma_old = sum(closes[-REGIME_GATE_SMA_DAYS - REGIME_GATE_SLOPE_DAYS:
+                                 -REGIME_GATE_SLOPE_DAYS]) / REGIME_GATE_SMA_DAYS
+            slope = sma_now - sma_old
+            dist = closes[-1] - sma_now
+            if slope < 0 and dist < -REGIME_GATE_THRESHOLD_PTS:
+                regime = "downtrend"
+            elif slope > 0 and dist > REGIME_GATE_THRESHOLD_PTS:
+                regime = "uptrend"
+            else:
+                regime = "chop"
+            self._regime_cache = regime
+            self._regime_cached_at = now
+            return regime
+        except Exception as e:
+            logger.warning(f"regime gate compute failed: {e} (defaulting to undefined)")
+            self._regime_cache = "undefined"
+            self._regime_cached_at = now
+            return "undefined"
+
     # ── 新訊號偵測 ────────────────────────────────────────────────
 
     def _check_new_signal(self, history: list, source: str):
@@ -857,6 +933,22 @@ class MTXStrategy:
                         self._last_seen_id[source] = trade_id
                         continue
                 # bias in ("neutral", "off") → no directional filter, fall through
+
+            # Regime gate (manual switch; default OFF). Blocks MTX long entries
+            # in confirmed downtrend regime. See REGIME_GATE_* env vars.
+            # Note: only blocks NEW entries (no pyramid handling here — pyramid
+            # path returns earlier; this gate fires before _enter).
+            if (REGIME_GATE_ENABLED and source == "mtx" and direction == "long"):
+                regime = self._check_regime()
+                if regime == "downtrend":
+                    logger.info(
+                        f"MTX long signal {trade_id} silent-absorbed by regime gate "
+                        f"(downtrend; SMA={REGIME_GATE_SMA_DAYS}d slope={REGIME_GATE_SLOPE_DAYS}d thr={REGIME_GATE_THRESHOLD_PTS})"
+                    )
+                    self._last_seen_id[source] = trade_id
+                    continue
+                # 'undefined' fails-open: if no daily_closes.json or insufficient
+                # history, we DON'T block (safer when data is unavailable)
 
             with self._lock:
                 units_here = self._units.get(source, [])
