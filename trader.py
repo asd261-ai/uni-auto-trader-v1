@@ -113,6 +113,13 @@ class AutoTrader:
         logger.info(f"Match | {match.productid} {match.bs} price={match.matchprice} qty={match.matchqty} orderno={match.orderno}")
         order_log.log_event("match", productid=match.productid, bs=match.bs,
                             orderno=match.orderno, matchprice=match.matchprice, matchqty=match.matchqty)
+        # Fill-anchoring (Plan B): let the strategy attribute this fill to a pending
+        # entry/exit and (if FILL_ANCHOR) report the real entry price to the Worker.
+        if self.strategy:
+            try:
+                self.strategy.on_fill(match.productid, match.bs, float(match.matchprice))
+            except Exception as e:
+                logger.debug(f"on_fill error (non-fatal): {e}")
 
     def _on_error(self, error):
         logger.error(f"API error: {error}")

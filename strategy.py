@@ -12,6 +12,7 @@ import heartbeat
 import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
+import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,14 @@ class MTXStrategy:
         self._recon_last_broker_net: Optional[int]          = None   # last observed broker signed net (for heartbeat)
         self._recon_last_expected:   Optional[int]          = None   # last computed expected signed net
 
+        # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
+        # order) so on_fill() attributes each Match to the right order even on
+        # reversals/replaces. Entry fills capture the unit's real entry price and
+        # (when FILL_ANCHOR) POST it to the Worker. FILL_ANCHOR default OFF — capture
+        # + log only; flip on after verifying capture is correct.
+        self._pending_fills: List[dict] = []
+        self._fill_anchor: bool         = os.getenv("FILL_ANCHOR", "0") == "1"
+
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
 
@@ -316,7 +325,8 @@ class MTXStrategy:
                     f"30m_bias_filter=on (require={FVG_30M_REQUIRE_BIAS}, ttl={FVG_30M_BIAS_TTL_MIN}min, cache={FVG_30M_BIAS_CACHE_SEC}s) | "
                     f"regime_gate={'ON' if REGIME_GATE_ENABLED else 'off'} "
                     f"(SMA={REGIME_GATE_SMA_DAYS}d slope={REGIME_GATE_SLOPE_DAYS}d thr={REGIME_GATE_THRESHOLD_PTS}pts; "
-                    f"daily_closes={'present' if DAILY_CLOSES_PATH.exists() else 'MISSING'})")
+                    f"daily_closes={'present' if DAILY_CLOSES_PATH.exists() else 'MISSING'}) | "
+                    f"fill_anchor={'ON' if self._fill_anchor else 'off'}")
 
     def stop(self):
         self._running = False
@@ -388,6 +398,33 @@ class MTXStrategy:
                 return
             for unit in all_units:
                 self._check_exit_unit(unit, price)
+
+    # ── 成交回報(fill-anchoring, Plan B)──────────────────────────
+    def on_fill(self, productid: str, bs: str, price: float):
+        """Called from trader._on_match (broker thread). Attribute this fill to the
+        front pending order (FIFO, send order). Entry fills capture the unit's real
+        entry price; when FILL_ANCHOR is on, report MTX entry fills to the Worker so
+        it re-anchors stop/target to the real entry. Exit fills are consumed (FIFO
+        alignment) but not acted on (Layer ① derives real exit P&L from orders.jsonl)."""
+        if productid != self.trader.config.get("product"):
+            return  # not our product (e.g. a manual trade in another contract)
+        with self._lock:
+            if not self._pending_fills or self._pending_fills[0]["bs"] != bs:
+                return  # front doesn't match → likely a manual/foreign fill; leave queue intact
+            pend = self._pending_fills.pop(0)
+            if pend["kind"] != "entry":
+                return  # exit fill — nothing to anchor
+            unit = pend["unit"]
+            if unit.get("entry_fill") is not None:
+                return
+            unit["entry_fill"] = price
+            sig_entry = unit.get("entry")
+            slip = round(price - sig_entry) if sig_entry else 0
+            logger.info(f"Entry fill | {pend['source']} id={pend['id']} {unit['dir']} "
+                        f"signal_entry={sig_entry} fill={price} slip={slip:+d} "
+                        f"anchor={'on' if self._fill_anchor else 'off'}")
+            if self._fill_anchor and pend["source"] == "mtx":
+                fill_emit.send({"source": "mtx", "id": pend["id"], "fill_price": price})
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
 
@@ -1145,8 +1182,15 @@ class MTXStrategy:
             "target":    trade.get("target"),
             "sig_label": trade.get("label") or trade.get("sigLabel", ""),
             "opened_at": int(time.time() * 1000),  # epoch ms, for trade duration calc
+            "entry_fill": None,                     # actual broker fill price (set by on_fill)
         }
         self._units.setdefault(source, []).append(unit)
+        # Fill-anchoring: register a pending ENTRY fill (in send order) so on_fill
+        # attributes the real entry price to this unit, reversal/replace-safe via FIFO.
+        if place_order:
+            self._pending_fills.append({"kind": "entry", "bs": "B" if direction == "long" else "S",
+                                        "unit": unit, "source": source, "id": unit["id"]})
+            self._pending_fills = self._pending_fills[-12:]
         logger.info(f"{source.upper()} Unit {len(self._units[source])} opened | "
                     f"{direction} entry={unit['entry']} stop={unit['stop']}")
 
@@ -1208,6 +1252,12 @@ class MTXStrategy:
                 self._execute_order("SELL", product, 1, opencloseflag="1")
             else:
                 self._execute_order("BUY", product, 1, opencloseflag="1")
+            # Fill-anchoring: register a pending EXIT fill so on_fill's FIFO stays
+            # aligned with send order (so an exit fill isn't mis-read as an entry fill
+            # on same-direction reversals). Exit fills are consumed but not acted on
+            # (Layer ① already derives real exit P&L from orders.jsonl).
+            self._pending_fills.append({"kind": "exit", "bs": "S" if unit["dir"] == "long" else "B"})
+            self._pending_fills = self._pending_fills[-12:]
 
         pnl_pts = 0
         if exit_price and unit["entry"]:
