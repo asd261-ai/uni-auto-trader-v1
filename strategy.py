@@ -277,7 +277,12 @@ class MTXStrategy:
                      and t.get("id", 0) > cutoff_ms],
                     key=lambda t: t["id"]
                 )
-                if open_trades:
+                # One-shot clean-start escape hatch: MTX_SKIP_RESTORE=1 forces a flat
+                # boot (skip restoring Worker-open trades) so phantom units from a prior
+                # bad session aren't pulled back in. Still advances last_seen_id so the
+                # poll loop won't re-fire already-seen signals.
+                skip_restore = os.getenv("MTX_SKIP_RESTORE", "0") == "1"
+                if open_trades and not skip_restore:
                     mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
                     for trade in open_trades[:mtx_cap]:
                         trade = self._normalize(trade, "mtx")
@@ -287,7 +292,7 @@ class MTXStrategy:
                     logger.info(f"Startup: {len(self._units['mtx'])} MTX unit(s) state restored")
                 else:
                     self._last_seen_id["mtx"] = history[0]["id"]
-                    logger.info(f"Startup: no current-session MTX open trades, last id={self._last_seen_id['mtx']}")
+                    logger.info(f"Startup: MTX no restore (skip={skip_restore}, open={len(open_trades)}), last id={self._last_seen_id['mtx']}")
         except Exception as e:
             logger.warning(f"Startup MTX fetch failed: {e}")
 

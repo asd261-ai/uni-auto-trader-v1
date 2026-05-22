@@ -1,5 +1,6 @@
 import time
 import logging
+import os
 from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 import order_log
 
@@ -19,6 +20,7 @@ class AutoTrader:
 
     def start(self):
         self._login()
+        self._resolve_product()
         self._register_callbacks()
         self._subscribe()
         self._running = True
@@ -50,6 +52,31 @@ class AutoTrader:
             raise RuntimeError("No accounts found after login")
         self.actno = accounts[0]
         logger.info(f"Logged in | account={self.actno}")
+
+    def _resolve_product(self):
+        """Resolve the real front-month contract code (e.g. MXFF6) from the broker.
+
+        viploginm rejects the near-month alias (e.g. MXFG5) with 商品代號錯誤; orders,
+        quote subscription, and recon must use the actual contract prod_id. Picks the
+        nearest (smallest-month) listed contract so rollover is automatic. Fails loud
+        rather than trade a code the broker will reject."""
+        base = os.getenv("UNITRADE_PRODUCT_BASE") or self.config["product"][:3]
+        resp = self.api.get_domestic_contracts(base, "F")
+        if not getattr(resp, "ok", False):
+            raise RuntimeError(f"Contract resolve failed for {base}: {getattr(resp, 'error', '?')}")
+        data = getattr(resp, "data", None) or []
+        if not data:
+            raise RuntimeError(f"No contracts returned for {base}")
+        try:
+            front = min(data, key=lambda d: int(getattr(d, "month", "999999")))
+        except (ValueError, TypeError):
+            front = data[0]
+        code = getattr(front, "prod_id", None)
+        if not code:
+            raise RuntimeError(f"Front contract has no prod_id for {base}: {front}")
+        old = self.config.get("product")
+        self.config["product"] = code
+        logger.info(f"Resolved front-month: {base} → {code} (month={getattr(front, 'month', '?')}, was={old})")
 
     def _register_callbacks(self):
         self.api.dquote.on_tick_data_trade = self._on_tick
@@ -160,7 +187,9 @@ class AutoTrader:
         order.ordertype = ordertype  # L:限價 M:市價 P:範圍市價
         order.price = price
         order.orderqty = qty
-        order.ordercondition = "R"   # R:ROD I:IOC F:FOK
+        # 市價(M)/範圍市價(P)在 viploginm 不允許 ROD(HHO0038:市價單不允許當日有效委託)→ 用 IOC;
+        # 只有限價(L)可用 ROD。 R:ROD I:IOC F:FOK
+        order.ordercondition = "R" if ordertype == "L" else "I"
         order.opencloseflag = opencloseflag  # "":自動 "0":新倉 "1":平倉
         order.dtrade = "N"
         order_log.log_event("sent", productid=productid, bs=bs, qty=qty,
