@@ -158,12 +158,17 @@ class AutoTrader:
             positions = getattr(resp, "data", None) or []
             product = self.config["product"]
             for p in positions:
-                if getattr(p, "productid", "") == product:
-                    return {
-                        "productid": p.productid,
-                        "bs":        getattr(p, "bs", ""),
-                        "qty":       getattr(p, "qty", 0),
-                    }
+                if getattr(p, "productid", "") != product:
+                    continue
+                # DPosition 沒有 .bs / .qty 欄位;部位掛在
+                # current_sell_open_position / current_buy_open_position
+                sell_qty = int(getattr(p, "current_sell_open_position", 0) or 0)
+                buy_qty  = int(getattr(p, "current_buy_open_position", 0) or 0)
+                if sell_qty > 0:
+                    return {"productid": p.productid, "bs": "S", "qty": sell_qty}
+                if buy_qty > 0:
+                    return {"productid": p.productid, "bs": "B", "qty": buy_qty}
+                return None  # 找到該商品但已平倉
         except Exception as e:
             logger.error(f"Position query failed: {e}")
         return None
