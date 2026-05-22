@@ -67,6 +67,15 @@ REGIME_GATE_THRESHOLD_PTS  = int(os.getenv("REGIME_GATE_THRESHOLD_PTS", "100"))
 DAILY_CLOSES_PATH          = Path(__file__).parent / "daily_closes.json"
 REGIME_CACHE_SEC           = int(os.getenv("REGIME_CACHE_SEC", "300"))  # re-read every 5 min
 
+# Half-size short side via skip-alternate (manual switch; default OFF).
+# At 1-lot granularity true 0.5× sizing is impossible, so for MTX SHORT signals
+# whose code is in HALF_SIZE_CODES we take only every 2nd qualifying signal
+# (≈50% participation) — approximating half exposure on those codes without
+# changing long / other-code size. Data (2026-05-22, 4.5mo) shows ③④ shorts
+# have no positive edge across 5/6 months; this trims that bleed while keeping
+# optionality (vs a full cut). Set via .env e.g. HALF_SIZE_CODES=3,4 ; empty → off.
+HALF_SIZE_CODES = {int(c) for c in os.getenv("HALF_SIZE_CODES", "").split(",") if c.strip().isdigit()}
+
 POLL_INTERVAL = 3     # seconds
 POINT_VALUE   = 50    # MXF: NT$50 per point
 PYRAMID_LOCK  = 15    # pts — first MTX unit stop locked to entry ± this on pyramid
@@ -187,6 +196,11 @@ class MTXStrategy:
         # once per REGIME_CACHE_SEC, computes ("uptrend"/"downtrend"/"chop"/"undefined").
         self._regime_cache:           Optional[str]   = None
         self._regime_cached_at:       float           = 0.0
+
+        # Half-size skip-alternate counter: per-code count of qualifying MTX short
+        # signals seen, used to take every 2nd one (≈50%). In-memory (resets on
+        # restart — acceptable, still ≈50% over time). See HALF_SIZE_CODES.
+        self._half_size_seen:         Dict[int, int]  = {}
 
         # Phase 7: daily MAX LOSS lock state. Counter accumulates across day+night
         # of the same trading day, resets at 08:45 TW (day session open).
@@ -995,6 +1009,22 @@ class MTXStrategy:
                     continue
                 # 'undefined' fails-open: if no daily_closes.json or insufficient
                 # history, we DON'T block (safer when data is unavailable)
+
+            # Half-size skip-alternate (manual switch; default OFF). For MTX SHORT
+            # signals whose code is in HALF_SIZE_CODES, silent-absorb every 2nd one
+            # (≈50% participation). Fires before _enter; pyramid path returns later
+            # so this only gates NEW entries, consistent with the regime gate above.
+            if (HALF_SIZE_CODES and source == "mtx" and direction == "short"):
+                _hs_code = int(trade.get("sigCode") or 0)
+                if _hs_code in HALF_SIZE_CODES:
+                    self._half_size_seen[_hs_code] = self._half_size_seen.get(_hs_code, 0) + 1
+                    if self._half_size_seen[_hs_code] % 2 == 0:
+                        logger.info(
+                            f"MTX short signal {trade_id} (code {_hs_code}) silent-absorbed "
+                            f"by half-size skip-alternate (≈50%, n={self._half_size_seen[_hs_code]})"
+                        )
+                        self._last_seen_id[source] = trade_id
+                        continue
 
             with self._lock:
                 units_here = self._units.get(source, [])
