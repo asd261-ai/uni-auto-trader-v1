@@ -451,6 +451,7 @@ class MTXStrategy:
             try:
                 self._check_session_change()
                 self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
+                self._check_daily_loss_lock()     # Phase 7: daily MAX LOSS lock from REAL P&L (restart-safe)
                 if not is_weekend:
                     for src_info in SIGNAL_SOURCES:
                         source = src_info["source"]
@@ -848,6 +849,40 @@ class MTXStrategy:
         if self._current_month is not None and new_month != self._current_month:
             self._archive_and_reset_month(self._current_month, new_month)
         self._current_month = new_month
+
+    def _check_daily_loss_lock(self):
+        """Set the daily MAX LOSS lock from the REAL-account daily P&L.
+
+        Source is pnl_calc (FIFO over the persistent orders.jsonl broker fills,
+        windowed to the 08:45 TW trading day) — so this is RESTART-SAFE: after a
+        restart while down, the next poll re-derives real P&L from fills and
+        re-locks immediately; it clears at 08:45 when _check_trading_day_reset
+        flips the flag and pnl_calc's day window slides to the new day.
+        Fail-open on a transient None read (leave lock state unchanged).
+        Note: real P&L is MTX-only (FVG runs paper, never hits orders.jsonl) —
+        correct scope for a real-money capital guard.
+        """
+        if DAILY_MAX_LOSS_PTS is None or self._trading_day_locked:
+            return
+        try:
+            real = pnl_calc.heartbeat_fields().get("real_trading_day_pnl_pts")
+        except Exception as e:
+            logger.debug(f"daily-loss lock: real P&L read failed (skip): {e}")
+            return
+        if real is None or real > DAILY_MAX_LOSS_PTS:
+            return
+        self._trading_day_locked = True
+        logger.warning(f"DAILY_MAX_LOSS triggered: real_day_pnl={real:+.0f} ≤ {DAILY_MAX_LOSS_PTS:+.0f}")
+        if not self._trading_day_alert_sent:
+            self._trading_day_alert_sent = True
+            self._safe_health_notify(
+                f"🛑 <b>每日 MAX LOSS 觸發</b>\n"
+                f"今日真倉損益:{real:+.0f} pts (NT${int(real * POINT_VALUE):,})\n"
+                f"門檻:{DAILY_MAX_LOSS_PTS:+.0f} pts\n"
+                f"動作:trader 已綁手,拒收新進場/加碼訊號\n"
+                f"既有持倉依自然 SL/TP/反向繼續\n"
+                f"重置時間:明早 08:45 TW(日盤前)"
+            )
 
     # ── 30m bias filter (Option C) ────────────────────────────────
 
@@ -1314,24 +1349,11 @@ class MTXStrategy:
             target=unit["target"], pnl_pts=pnl_pts, reason=reason,
             sig_id=unit["id"], opened_at_ms=unit.get("opened_at"),
         )
-        # Phase 7: accumulate into trading-day P&L counter (persists across session changes).
-        # Paper-mode FVG closes still count — paper outcomes inform whether to keep going.
+        # Phase 7: accumulate signal-side trading-day P&L — DISPLAY ONLY (heartbeat
+        # field trading_day_pnl_pts). Lock authority moved to _check_daily_loss_lock,
+        # which reads the restart-safe REAL-account P&L from pnl_calc. (Old behaviour
+        # used this in-memory counter, which mixed in paper FVG and reset on restart.)
         self._trading_day_pnl_pts += pnl_pts
-        if (DAILY_MAX_LOSS_PTS is not None
-                and not self._trading_day_locked
-                and self._trading_day_pnl_pts <= DAILY_MAX_LOSS_PTS):
-            self._trading_day_locked = True
-            logger.warning(f"DAILY_MAX_LOSS triggered: pnl={self._trading_day_pnl_pts:+.0f} ≤ {DAILY_MAX_LOSS_PTS:+.0f}")
-            if not self._trading_day_alert_sent:
-                self._trading_day_alert_sent = True
-                self._safe_health_notify(
-                    f"🛑 <b>每日 MAX LOSS 觸發</b>\n"
-                    f"今日損益:{self._trading_day_pnl_pts:+.0f} pts (NT${int(self._trading_day_pnl_pts * POINT_VALUE):,})\n"
-                    f"門檻:{DAILY_MAX_LOSS_PTS:+.0f} pts\n"
-                    f"動作:trader 已綁手,拒收新進場/加碼訊號\n"
-                    f"既有持倉依自然 SL/TP/反向繼續\n"
-                    f"重置時間:明早 08:45 TW"
-                )
         self._units[source].remove(unit)
 
         # Persist FVG state after change (MTX is recoverable from Worker KV)
