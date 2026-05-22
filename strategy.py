@@ -11,6 +11,7 @@ import requests
 import heartbeat
 import trade_log_emit
 import telegram_notify as tg
+import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 
 logger = logging.getLogger(__name__)
 
@@ -459,6 +460,9 @@ class MTXStrategy:
                 "recon_broker_net":    self._recon_last_broker_net,
                 "recon_expected_net":  self._recon_last_expected,
                 "recon_alert_sent":    self._recon_alert_sent,
+                # Additive real-fill P&L (broker Match prices, FIFO from orders.jsonl).
+                # Coexists with the signal-based trading_day_pnl_pts/month_pnl_pts above.
+                **pnl_calc.heartbeat_fields(),
             })
             time.sleep(POLL_INTERVAL)
 
