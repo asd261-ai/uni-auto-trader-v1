@@ -38,6 +38,29 @@ def parse_broker_position(p, product: str):
     return None
 
 
+def parse_fill(bs, matchprice, matchqty):
+    """Validate a broker Match's fields before they reach the P&L log / fill FIFO.
+    Returns (price: float, qty: int) | None. None = malformed → caller rejects.
+
+    Field-level only (type + sane range + valid side). Product filtering stays
+    with the caller / on_fill — this just stops garbage (0/negative/NaN/inf price,
+    bad side, non-numeric qty) from contaminating order_log P&L or the fill FIFO.
+    """
+    if bs not in ("B", "S"):
+        return None
+    try:
+        price = float(matchprice)
+        qty = int(matchqty)
+    except (TypeError, ValueError):
+        return None
+    # price band catches 0, negative, NaN (NaN>0 is False) and inf (inf<bound False)
+    if not (0 < price < 1_000_000):
+        return None
+    if not (0 < qty <= _MAX_SANE_QTY):
+        return None
+    return price, qty
+
+
 def clean_feed(raw, max_items: int = 1000):
     """Validate an HTTP feed payload (MTX /api/history and FVG /api/signals share
     a trade-like dict shape). Returns (items, ok).

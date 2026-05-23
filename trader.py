@@ -3,7 +3,7 @@ import logging
 import os
 from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 import order_log
-from feed_schema import parse_broker_position, SCHEMA_FAIL
+from feed_schema import parse_broker_position, parse_fill, SCHEMA_FAIL
 
 logger = logging.getLogger(__name__)
 
@@ -111,14 +111,26 @@ class AutoTrader:
                             orderno=reply.orderno, orderstatus=reply.orderstatus)
 
     def _on_match(self, match):
-        logger.info(f"Match | {match.productid} {match.bs} price={match.matchprice} qty={match.matchqty} orderno={match.orderno}")
-        order_log.log_event("match", productid=match.productid, bs=match.bs,
-                            orderno=match.orderno, matchprice=match.matchprice, matchqty=match.matchqty)
+        # Schema gate: reject malformed fills before they reach the P&L log or the
+        # fill FIFO. A bad matchprice would contaminate orders.jsonl P&L (and could
+        # trip DAILY_MAX_LOSS) and, with FILL_ANCHOR, re-anchor stops to a junk price.
+        bs = getattr(match, "bs", "")
+        fill = parse_fill(bs, getattr(match, "matchprice", None), getattr(match, "matchqty", None))
+        if fill is None:
+            logger.error(
+                f"FILL_REJECTED: malformed match product={getattr(match, 'productid', '?')!r} "
+                f"bs={bs!r} price={getattr(match, 'matchprice', '?')!r} qty={getattr(match, 'matchqty', '?')!r}"
+            )
+            return
+        price, qty = fill
+        logger.info(f"Match | {match.productid} {bs} price={price} qty={qty} orderno={match.orderno}")
+        order_log.log_event("match", productid=match.productid, bs=bs,
+                            orderno=match.orderno, matchprice=price, matchqty=qty)
         # Fill-anchoring (Plan B): let the strategy attribute this fill to a pending
         # entry/exit and (if FILL_ANCHOR) report the real entry price to the Worker.
         if self.strategy:
             try:
-                self.strategy.on_fill(match.productid, match.bs, float(match.matchprice))
+                self.strategy.on_fill(match.productid, bs, price)
             except Exception as e:
                 logger.debug(f"on_fill error (non-fatal): {e}")
 
