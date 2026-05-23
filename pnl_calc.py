@@ -20,7 +20,13 @@ _CACHE_SEC = 30
 
 
 def _read_matches(base: str):
-    out = []
+    """Return {productid: [(ts, bs, price), ...]} grouped by EXACT contract.
+
+    Grouping by productid keeps each contract month in its own FIFO queue so a
+    different month (e.g. MXFG6 next to MXFF6) or a manual hand-trade can never
+    cross-pair and corrupt the bot's P&L / loss-lock input.
+    """
+    out = {}
     if not os.path.exists(_ORDERS_PATH):
         return out
     try:
@@ -44,7 +50,7 @@ def _read_matches(base: str):
                     continue
                 qty = int(r.get("matchqty") or 1)
                 for _ in range(max(1, qty)):
-                    out.append((r.get("ts", ""), bs, float(price)))
+                    out.setdefault(pid, []).append((r.get("ts", ""), bs, float(price)))
     except Exception:
         return out
     return out
@@ -73,13 +79,19 @@ def _trading_day_start_iso() -> str:
 
 
 def _compute(base: str):
-    closed, pos = _fifo(_read_matches(base))
+    by_pid = _read_matches(base)
+    closed = []
+    pos_all = []  # (pid, side, price)
+    for pid in sorted(by_pid):
+        c, p = _fifo(by_pid[pid])        # FIFO per contract — never cross-pair months
+        closed.extend(c)
+        pos_all.extend((pid, s, pr) for s, pr in p)
     day_start = _trading_day_start_iso()
     month = datetime.now(_TZ).strftime("%Y-%m")
     day_pnl = sum(p for ts, p in closed if ts >= day_start)
     day_cnt = sum(1 for ts, p in closed if ts >= day_start)
     month_pnl = sum(p for ts, p in closed if ts[:7] == month)
-    open_desc = ",".join(f"{s}@{pr:.0f}" for s, pr in pos) if pos else "flat"
+    open_desc = ",".join(f"{pid}:{s}@{pr:.0f}" for pid, s, pr in pos_all) if pos_all else "flat"
     return {
         "real_trading_day_pnl_pts": round(day_pnl, 1),
         "real_trading_day_trades":  day_cnt,
