@@ -13,7 +13,7 @@ import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
-from feed_schema import SCHEMA_FAIL
+from feed_schema import SCHEMA_FAIL, clean_feed
 
 logger = logging.getLogger(__name__)
 
@@ -1523,10 +1523,17 @@ class MTXStrategy:
 
     def _fetch_history(self, url: str = HISTORY_URL) -> list:
         """Fetch raw history/signals list from a source URL. Used for both MTX
-        history and FVG signals — same shape (list of trade-like dicts)."""
+        history and FVG signals — same shape (list of trade-like dicts).
+
+        Passes the payload through feed_schema.clean_feed: drops malformed entries
+        (non-dict / non-int id) and detects a wholly-malformed (non-list) payload,
+        so junk from the Worker can't reach the cursor/sync logic."""
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        return resp.json() or []
+        items, ok = clean_feed(resp.json() or [])
+        if not ok:
+            logger.error(f"FEED_MALFORMED: non-list payload from {url} — dropped")
+        return items
 
     # ── FVG_MODE='shadow' observe-only path ───────────────────────
     def _observe_fvg_signals(self, signals: list):

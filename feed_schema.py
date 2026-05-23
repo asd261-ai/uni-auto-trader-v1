@@ -36,3 +36,24 @@ def parse_broker_position(p, product: str):
     if buy > 0:
         return {"productid": product, "bs": "B", "qty": buy}
     return None
+
+
+def clean_feed(raw, max_items: int = 1000):
+    """Validate an HTTP feed payload (MTX /api/history and FVG /api/signals share
+    a trade-like dict shape). Returns (items, ok).
+
+    ok=False  = payload was not even a list (e.g. an error object) — caller logs.
+    items     = only dict entries carrying an int `id`, capped at max_items.
+
+    Enforces just the list + int-id invariant the downstream cursor/sync logic
+    actually depends on (`_last_seen_id`, age math on `id`). Deliberately does
+    NOT enforce a status enum: MTX and FVG use different status sets, so that
+    check belongs to each consumer, not this shared boundary.
+    """
+    if not isinstance(raw, list):
+        return [], False
+    items = [
+        x for x in raw[:max_items]
+        if isinstance(x, dict) and isinstance(x.get("id"), int)
+    ]
+    return items, True
