@@ -9,14 +9,23 @@ DIR=/home/ubuntu/uni-auto-trader-v1
 
 if runuser -u ubuntu -- bash -c "cd $DIR && timeout 45 ./.venv/bin/python verify_login.py" \
         >/tmp/uni-recover-verify.log 2>&1; then
-    # Broker login OK. Cool-off ≥30s before restart so the fresh login's dquote
-    # subscribe isn't rate-limited (known broker behavior on rapid logins).
-    sleep 35
-    systemctl restart uni-trader
-    sleep 12
-    ACTIVE=$(systemctl is-active uni-trader)
-    STARTED=$(journalctl -u uni-trader --since "40 sec ago" --no-pager 2>/dev/null | grep -c "AutoTrader started")
-    echo "$(date '+%F %T') recover: login OK -> restarted; active=$ACTIVE started_log=$STARTED" >>"$LOG"
+    # Broker login OK. Smoke-test the fill schema gate before restart: never bring
+    # the real-money trader up on a broken parse_fill (a garbled gate would let a
+    # junk matchprice contaminate order_log P&L / FILL_ANCHOR FIFO). Fail loud and
+    # do NOT restart if the gate tests fail.
+    if runuser -u ubuntu -- bash -c "cd $DIR && ./.venv/bin/python -m unittest test_fill_schema" \
+            >/tmp/uni-recover-smoke.log 2>&1; then
+        # Cool-off ≥30s before restart so the fresh login's dquote subscribe isn't
+        # rate-limited (known broker behavior on rapid logins).
+        sleep 35
+        systemctl restart uni-trader
+        sleep 12
+        ACTIVE=$(systemctl is-active uni-trader)
+        STARTED=$(journalctl -u uni-trader --since "40 sec ago" --no-pager 2>/dev/null | grep -c "AutoTrader started")
+        echo "$(date '+%F %T') recover: login OK + fill-gate OK -> restarted; active=$ACTIVE started_log=$STARTED" >>"$LOG"
+    else
+        echo "$(date '+%F %T') recover: login OK but FILL-GATE TESTS FAILED -> NOT restarted (check feed_schema.py + /tmp/uni-recover-smoke.log)" >>"$LOG"
+    fi
 else
     echo "$(date '+%F %T') recover: login STILL FAIL -> not restarted (broker still down)" >>"$LOG"
 fi
