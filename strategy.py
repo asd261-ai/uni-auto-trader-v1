@@ -13,6 +13,7 @@ import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
+from feed_schema import SCHEMA_FAIL
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class MTXStrategy:
         self._recon_last_check:      float                  = 0.0    # epoch s of last check
         self._recon_mismatch_since:  Optional[float]        = None   # when mismatch first observed
         self._recon_alert_sent:      bool                   = False  # one-shot dedup
+        self._recon_schema_alert_sent: bool                 = False  # one-shot dedup for SDK schema drift
         self._recon_last_broker_net: Optional[int]          = None   # last observed broker signed net (for heartbeat)
         self._recon_last_expected:   Optional[int]          = None   # last computed expected signed net
 
@@ -378,6 +380,14 @@ class MTXStrategy:
         # Weekend: market closed → suppress Telegram notify (same rationale as on_disconnect)
         if datetime.now(TZ_TW).weekday() >= 5:
             logger.info("Reconnect notify suppressed (weekend)")
+            return
+
+        if broker_pos is SCHEMA_FAIL:
+            logger.error("Reconnect: broker position schema drift — cannot verify alignment")
+            threading.Thread(target=self._safe_health_notify, args=(
+                f"⚠️ <b>重連無法核對倉位{dry_tag}</b>\n"
+                f"券商持倉回應欄位漂移，無法判讀。本地 net={net}。\n請手動確認券商實際倉位!",
+            ), daemon=True).start()
             return
 
         if broker_pos:
@@ -756,6 +766,22 @@ class MTXStrategy:
         except Exception as e:
             logger.debug(f"recon: broker query failed (silent): {e}")
             return
+
+        # SDK schema drift: the response shape can't be trusted. Pause recon this
+        # cycle — do NOT fall through to net=0, which reads as "flat" and would
+        # false-alert on every genuinely-held position (the 2026-05 recon bug).
+        if broker_pos is SCHEMA_FAIL:
+            logger.error("recon: broker position schema drift — recon paused this cycle")
+            if not self._recon_schema_alert_sent:
+                self._recon_schema_alert_sent = True
+                self._safe_health_notify(
+                    "⚠️ <b>Broker 對帳暫停</b>\n"
+                    "券商持倉回應欄位漂移（schema drift），無法可靠判讀 net。\n"
+                    "對帳已暫停（不誤報），請檢查 SDK / DPosition 欄位是否變動。"
+                )
+            return
+        # Good read — clear the schema-drift alert latch.
+        self._recon_schema_alert_sent = False
 
         # Broker returns {productid, bs, qty} or None.
         if broker_pos is None:

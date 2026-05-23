@@ -3,6 +3,7 @@ import logging
 import os
 from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 import order_log
+from feed_schema import parse_broker_position, SCHEMA_FAIL
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +144,12 @@ class AutoTrader:
         if self.strategy:
             self.strategy.on_disconnect()
 
-    def _query_broker_position(self) -> dict | None:
-        """查詢券商端目前持倉，回傳 {productid, bs, qty} 或 None。
+    def _query_broker_position(self):
+        """查詢券商端目前持倉，回傳 {productid, bs, qty} | None | SCHEMA_FAIL。
+
+        None = 該商品已平倉 / 不在回傳中。SCHEMA_FAIL = SDK 物件欄位漂移
+        （見 feed_schema.parse_broker_position）；呼叫端必須當「對帳暫停」處理，
+        絕不可當成平倉。
 
         SDK signature: daccount.get_position(actno, groupid='', trader='') -> DPositionResponse
         DPositionResponse has fields (ok, error, data=[DPosition,...]).
@@ -158,17 +163,16 @@ class AutoTrader:
             positions = getattr(resp, "data", None) or []
             product = self.config["product"]
             for p in positions:
-                if getattr(p, "productid", "") != product:
-                    continue
-                # DPosition 沒有 .bs / .qty 欄位;部位掛在
-                # current_sell_open_position / current_buy_open_position
-                sell_qty = int(getattr(p, "current_sell_open_position", 0) or 0)
-                buy_qty  = int(getattr(p, "current_buy_open_position", 0) or 0)
-                if sell_qty > 0:
-                    return {"productid": p.productid, "bs": "S", "qty": sell_qty}
-                if buy_qty > 0:
-                    return {"productid": p.productid, "bs": "B", "qty": buy_qty}
-                return None  # 找到該商品但已平倉
+                r = parse_broker_position(p, product)
+                if r is SCHEMA_FAIL:
+                    logger.error(
+                        "BROKER_SCHEMA_DRIFT: DPosition missing expected "
+                        "open-position fields or returned out-of-range qty"
+                    )
+                    return SCHEMA_FAIL
+                if r is not None:
+                    return r
+            return None  # 該商品不在回傳中 / 已平倉
         except Exception as e:
             logger.error(f"Position query failed: {e}")
         return None
