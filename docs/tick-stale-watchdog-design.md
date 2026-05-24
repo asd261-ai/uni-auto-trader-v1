@@ -1,7 +1,10 @@
-# Tick-stale watchdog — design proposal
+# Tick-stale watchdog — design
 
-> Status: **PROPOSAL ONLY — not implemented, not deployed.** Local design doc; no trader
-> code or VPS file is touched. Author: Bob, 2026-05-23. Surface map from code-researcher.
+> Status: **IMPLEMENTED (Phase 1, observe-only) — not yet deployed to VPS.** Code lives in
+> `tick_watchdog.py` (`TickStaleWatchdog`, 13 unit tests) + `strategy.py` hooks; alerts go to the
+> log as `[tick-wd OBSERVE]`, NOT Telegram. PR #1 (`tick-stale-watchdog` → `main`). Deploy via
+> scp + sha256 verify + restart on a weekday; Phase 2 swaps the log-lambda for `_safe_health_notify`.
+> Author: Bob, 2026-05-23 (status updated 2026-05-25). Surface map from code-researcher.
 
 ## Problem
 
