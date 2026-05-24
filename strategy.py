@@ -14,6 +14,7 @@ import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
+from tick_watchdog import TickStaleWatchdog
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,11 @@ FVG_STATE_PATH       = Path(__file__).parent / "fvg_state.json"
 # Plan D: broker reconciliation
 RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
 RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
+
+# Tick-stale watchdog: detect when the dquote tick feed silently stops (alive but blind).
+TICK_STALE_DAY_SEC      = int(os.getenv("TICK_STALE_DAY_SEC", "90"))     # liquid day session
+TICK_STALE_NIGHT_SEC    = int(os.getenv("TICK_STALE_NIGHT_SEC", "300"))  # thin night session
+TICK_CHECK_INTERVAL_SEC = int(os.getenv("TICK_CHECK_INTERVAL_SEC", "30"))
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
@@ -228,6 +234,14 @@ class MTXStrategy:
         self._recon_schema_alert_sent: bool                 = False  # one-shot dedup for SDK schema drift
         self._recon_last_broker_net: Optional[int]          = None   # last observed broker signed net (for heartbeat)
         self._recon_last_expected:   Optional[int]          = None   # last computed expected signed net
+
+        # Tick-stale watchdog: detect when the dquote tick feed silently stops delivering
+        # (trader alive but blind to price → exits won't fire). Alert-only; see tick_watchdog.py.
+        self._tick_wd = TickStaleWatchdog(
+            day_threshold=TICK_STALE_DAY_SEC,
+            night_threshold=TICK_STALE_NIGHT_SEC,
+            check_interval=TICK_CHECK_INTERVAL_SEC,
+        )
 
         # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
         # order) so on_fill() attributes each Match to the right order even on
@@ -416,6 +430,7 @@ class MTXStrategy:
     # ── 行情 tick 回調 ────────────────────────────────────────────
 
     def on_tick(self, price: float):
+        self._tick_wd.record_tick(time.time())   # stamp BEFORE the flat early-return below
         with self._lock:
             all_units = self._flatten_units()
             if not all_units:
@@ -498,6 +513,19 @@ class MTXStrategy:
                 self._check_broker_reconciliation()
             except Exception as e:
                 logger.debug(f"recon error (silent): {e}")
+            # Tick-stale watchdog: detect if the dquote feed goes silent during an active
+            # session (self-throttled + session/weekend-gated inside check()).
+            # PHASE 1 (observe-only): route alerts to the log, NOT Telegram — validates
+            # thresholds/gating live on viploginm with zero noise and zero trading impact.
+            # PHASE 2: change the notify callback to self._safe_health_notify for real alerts.
+            try:
+                self._tick_wd.check(
+                    time.time(), self._current_session,
+                    datetime.now(TZ_TW).weekday() >= 5,
+                    lambda m: logger.warning(f"[tick-wd OBSERVE] {m}"),  # PHASE 2: -> self._safe_health_notify
+                )
+            except Exception as e:
+                logger.debug(f"tick watchdog error (silent): {e}")
             # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
             # errors (watchdog needs to see "process alive but polls failing" as a signal).
             mtx_units = self._units.get("mtx", [])
@@ -522,6 +550,7 @@ class MTXStrategy:
                 "recon_broker_net":    self._recon_last_broker_net,
                 "recon_expected_net":  self._recon_last_expected,
                 "recon_alert_sent":    self._recon_alert_sent,
+                "last_tick_age_sec":   self._tick_wd.last_tick_age(time.time()),
                 # Additive real-fill P&L (broker Match prices, FIFO from orders.jsonl).
                 # Coexists with the signal-based trading_day_pnl_pts/month_pnl_pts above.
                 **pnl_calc.heartbeat_fields(),
