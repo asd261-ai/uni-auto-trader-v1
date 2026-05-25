@@ -22,6 +22,8 @@ def load_mtx_state(path):
             data = json.load(f)
     except (OSError, ValueError):
         return []
+    if not isinstance(data, dict):
+        return []
     units = data.get("mtx_units")
     return units if isinstance(units, list) else []
 

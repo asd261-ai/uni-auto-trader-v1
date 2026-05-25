@@ -1,6 +1,7 @@
 """Tests for mtx_restore. Pure stdlib unittest (system python3, no deps).
 Run:  python3 -m unittest test_mtx_restore -v
 """
+import json
 import os
 import tempfile
 import unittest
@@ -24,6 +25,13 @@ class StateRoundTripTest(unittest.TestCase):
         path = os.path.join(d, "mtx_state.json")
         with open(path, "w") as f:
             f.write("{not json")
+        self.assertEqual(mr.load_mtx_state(path), [])
+
+    def test_load_toplevel_list_returns_empty(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "mtx_state.json")
+        with open(path, "w") as f:
+            json.dump([{"id": 1}], f)
         self.assertEqual(mr.load_mtx_state(path), [])
 
 
@@ -73,6 +81,18 @@ class ReconcileRestoreTest(unittest.TestCase):
             cutoff_ms=self.CUTOFF,
         )
         self.assertEqual(len(rec["to_restore"]), 1)
+        self.assertEqual(rec["to_restore"][0]["id"], 2000)
+        self.assertEqual(rec["to_restore"][0]["stop"], 43559)
+
+    def test_all_terminal_statuses_go_to_record_exit(self):
+        for status in ("profit", "loss", "trail", "reversed", "session_end"):
+            rec = mr.reconcile_restore(
+                local_units=[self._local()],
+                worker_history=[{"id": 2000, "status": status, "exit": 43500}],
+                cutoff_ms=self.CUTOFF,
+            )
+            self.assertEqual(rec["to_restore"], [], f"{status} should not restore")
+            self.assertEqual(len(rec["to_record_exit"]), 1, f"{status} should record exit")
 
     def test_stale_local_unit_below_cutoff_dropped(self):
         rec = mr.reconcile_restore(
