@@ -103,9 +103,10 @@ TZ_TW = timezone(timedelta(hours=8))
 TRADES_LOG_PATH      = Path(__file__).parent / "trades.jsonl"
 MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 
-# FVG position persistent state (Plan A trader-side companion). Phase 6b stores
-# _units['fvg'] (list of 0/1 units). MTX is restored from Worker KV at startup,
-# so we don't persist it locally.
+# Per-source persistent unit state (trader-side, restart-safe). Both MTX and FVG
+# persist their open units locally — authoritative on restart for what the bot
+# ACTUALLY holds; the Worker KV is reconciled against it (levels + missed exits),
+# never trusted blindly (that caused phantom MTX units — see mtx_restore.py).
 FVG_STATE_PATH       = Path(__file__).parent / "fvg_state.json"
 MTX_STATE_PATH       = Path(__file__).parent / "mtx_state.json"
 
