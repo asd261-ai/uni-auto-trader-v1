@@ -13,3 +13,5 @@ trades.jsonl
 monthly_summary.jsonl
 fvg_state.json
 fvg_state.json.tmp
+mtx_state.json
+mtx_state.json.tmp

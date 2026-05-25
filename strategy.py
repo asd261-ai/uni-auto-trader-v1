@@ -12,6 +12,7 @@ import heartbeat
 import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
+from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
@@ -106,6 +107,7 @@ MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 # _units['fvg'] (list of 0/1 units). MTX is restored from Worker KV at startup,
 # so we don't persist it locally.
 FVG_STATE_PATH       = Path(__file__).parent / "fvg_state.json"
+MTX_STATE_PATH       = Path(__file__).parent / "mtx_state.json"
 
 # Plan D: broker reconciliation
 RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
@@ -756,6 +758,14 @@ class MTXStrategy:
         except Exception as e:
             logger.error(f"FVG state save failed: {e}")
 
+    def _save_mtx_state(self) -> None:
+        """Atomic write of _units['mtx'] to disk — the bot's authoritative record of
+        which MTX units it actually opened. Read at startup by the restore reconciler."""
+        try:
+            save_mtx_state(str(MTX_STATE_PATH), self._units.get("mtx", []))
+        except Exception as e:
+            logger.error(f"MTX state save failed: {e}")
+
     def _expected_net_position(self) -> int:
         """Trader's expected signed net lots = sum across all source unit lists."""
         net = 0
@@ -1320,9 +1330,11 @@ class MTXStrategy:
         logger.info(f"{source.upper()} Unit {len(self._units[source])} opened | "
                     f"{direction} entry={unit['entry']} stop={unit['stop']}")
 
-        # Persist FVG units to disk (MTX is recoverable from Worker KV)
+        # Persist unit state to disk so restart restores what the bot ACTUALLY holds.
         if source == "fvg":
             self._save_fvg_state()
+        elif source == "mtx" and place_order:   # real open only; restore path saves at end
+            self._save_mtx_state()
 
         if not notify:
             return
@@ -1417,9 +1429,11 @@ class MTXStrategy:
         self._trading_day_pnl_pts += pnl_pts
         self._units[source].remove(unit)
 
-        # Persist FVG state after change (MTX is recoverable from Worker KV)
+        # Persist state after change so disk reflects live positions crash-safely.
         if source == "fvg":
             self._save_fvg_state()
+        elif source == "mtx":
+            self._save_mtx_state()
 
         emoji     = EXIT_EMOJI.get(reason, "⏹")
         tag       = SOURCE_TAG.get(source, "")
