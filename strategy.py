@@ -553,7 +553,9 @@ class MTXStrategy:
                 "last_tick_age_sec":   self._tick_wd.last_tick_age(time.time()),
                 # Additive real-fill P&L (broker Match prices, FIFO from orders.jsonl).
                 # Coexists with the signal-based trading_day_pnl_pts/month_pnl_pts above.
-                **pnl_calc.heartbeat_fields(),
+                # Scoped to the bot's own contract so manual trades in other months
+                # (shared account) don't pollute the reported real P&L.
+                **pnl_calc.heartbeat_fields(base=self.trader.config["product"]),
             })
             time.sleep(POLL_INTERVAL)
 
@@ -914,13 +916,17 @@ class MTXStrategy:
         re-locks immediately; it clears at 08:45 when _check_trading_day_reset
         flips the flag and pnl_calc's day window slides to the new day.
         Fail-open on a transient None read (leave lock state unchanged).
-        Note: real P&L is MTX-only (FVG runs paper, never hits orders.jsonl) —
-        correct scope for a real-money capital guard.
+        Scope is the bot's resolved contract only (config["product"], e.g. MXFF6):
+        the shared broker account also logs Sean's MANUAL trades in other months
+        (e.g. MXFG6) into orders.jsonl — those must NOT trip the bot's lock.
+        (FVG runs paper, never hits orders.jsonl.)
         """
         if DAILY_MAX_LOSS_PTS is None or self._trading_day_locked:
             return
         try:
-            real = pnl_calc.heartbeat_fields().get("real_trading_day_pnl_pts")
+            real = pnl_calc.heartbeat_fields(
+                base=self.trader.config["product"]
+            ).get("real_trading_day_pnl_pts")
         except Exception as e:
             logger.debug(f"daily-loss lock: real P&L read failed (skip): {e}")
             return
