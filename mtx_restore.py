@@ -32,3 +32,53 @@ def save_mtx_state(path, units):
     with open(tmp, "w") as f:
         json.dump({"mtx_units": list(units)}, f, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def _worker_by_id(worker_history):
+    out = {}
+    for t in worker_history or []:
+        if isinstance(t, dict) and "id" in t:
+            out[t["id"]] = t
+    return out
+
+
+def reconcile_restore(local_units, worker_history, cutoff_ms):
+    """Decide what to do with each locally-persisted MTX unit at startup.
+
+    Returns dict:
+      to_restore       : [unit]            restore as open; stop/target refreshed from Worker
+      to_record_exit   : [(unit, worker)]  exited while bot was down; record once, do NOT restore
+      dropped_stale    : [id]              local unit at/below the session boot floor; drop
+      skipped_phantoms : [id]              Worker-open ids NOT in local (the phantom class); not restored
+    """
+    by_id = _worker_by_id(worker_history)
+    local_ids = set()
+    to_restore, to_record_exit, dropped_stale = [], [], []
+    for u in local_units or []:
+        if not isinstance(u, dict) or "id" not in u:
+            continue
+        uid = u["id"]
+        local_ids.add(uid)
+        if uid <= cutoff_ms:
+            dropped_stale.append(uid)
+            continue
+        w = by_id.get(uid)
+        if w is None:
+            to_restore.append(dict(u))                       # conservative: keep local as-is
+        elif w.get("status") == "open":
+            merged = dict(u)
+            for k in ("stop", "target"):                     # refresh current levels from Worker
+                if w.get(k) is not None:
+                    merged[k] = w[k]
+            to_restore.append(merged)
+        elif w.get("status") in TERMINAL_STATUSES:
+            to_record_exit.append((dict(u), dict(w)))
+        else:
+            to_restore.append(dict(u))                       # unknown status: conservative
+    skipped_phantoms = [
+        t["id"] for t in (worker_history or [])
+        if isinstance(t, dict) and t.get("status") == "open"
+        and t.get("id") not in local_ids and t.get("id", 0) > cutoff_ms
+    ]
+    return {"to_restore": to_restore, "to_record_exit": to_record_exit,
+            "dropped_stale": dropped_stale, "skipped_phantoms": skipped_phantoms}
