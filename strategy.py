@@ -323,6 +323,10 @@ class MTXStrategy:
                     mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
                     for u in rec["to_restore"][:mtx_cap]:
                         u = self._normalize(u, "mtx")
+                        # Local units store the signal label under "sig_label", and _normalize
+                        # blanks "label" (no Worker "sigLabel" present). Recover it so _open_unit
+                        # (reads "label") keeps the label on restore.
+                        u["label"] = u.get("label") or u.get("sig_label", "")
                         logger.info(f"Startup: restoring MTX id={u['id']} dir={u['dir']} "
                                     f"(local-confirmed, no order placed)")
                         self._open_unit(u, source="mtx", notify=False, place_order=False)
