@@ -13,6 +13,7 @@ import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
+from session_timing import session_summary_action
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
@@ -80,6 +81,7 @@ REGIME_CACHE_SEC           = int(os.getenv("REGIME_CACHE_SEC", "300"))  # re-rea
 HALF_SIZE_CODES = {int(c) for c in os.getenv("HALF_SIZE_CODES", "").split(",") if c.strip().isdigit()}
 
 POLL_INTERVAL = 3     # seconds
+SESSION_SUMMARY_DELAY_SEC = 300   # delay session-close summary so bell/session_end trades settle
 POINT_VALUE   = 50    # MXF: NT$50 per point
 PYRAMID_LOCK  = 15    # pts — first MTX unit stop locked to entry ± this on pyramid
 
@@ -181,6 +183,8 @@ class MTXStrategy:
 
         # Session tracking
         self._current_session: Optional[str] = None
+        self._pending_summary_session: Optional[str] = None  # deferred session-close summary
+        self._pending_summary_due:     float         = 0.0   # epoch seconds it becomes due
         self._session_trades:  List[dict]    = []
         self._prev_session_pnl_pts: float    = 0.0
         self._prev_session_label:   str      = ""
@@ -572,15 +576,23 @@ class MTXStrategy:
     def _check_session_change(self):
         now     = datetime.now(TZ_TW)
         session = _get_session(now)
-        if session == self._current_session:
-            return
-        if self._current_session in ("day", "night") and session == "break":
-            self._send_session_summary(self._current_session)
+        # Defer the session-close summary ~5 min so bell/session_end closes land in
+        # _session_trades first. session_summary_action runs every poll (no early-return).
+        act = session_summary_action(
+            self._current_session, session,
+            self._pending_summary_session, self._pending_summary_due,
+            time.time(), SESSION_SUMMARY_DELAY_SEC,
+        )
+        if act["fire"] is not None:
+            self._send_session_summary(act["fire"])
             self._session_trades = []
-        self._current_session = session
-        if session in ("day", "night"):
-            logger.info(f"{'日盤' if session == 'day' else '夜盤'}開始")
-            threading.Thread(target=self._send_open_notify, args=(session,), daemon=True).start()
+        self._pending_summary_session = act["pending_session"]
+        self._pending_summary_due     = act["due_at"]
+        if session != self._current_session:
+            self._current_session = session
+            if session in ("day", "night"):
+                logger.info(f"{'日盤' if session == 'day' else '夜盤'}開始")
+                threading.Thread(target=self._send_open_notify, args=(session,), daemon=True).start()
 
     @staticmethod
     def _compute_trading_day(now: datetime) -> date:
