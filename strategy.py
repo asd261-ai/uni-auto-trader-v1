@@ -308,33 +308,36 @@ class MTXStrategy:
                     session_start = now_tw - timedelta(hours=1)  # break or unknown: conservative 1h
 
                 cutoff_ms = int(session_start.timestamp() * 1000)
-                # Only restore signals whose Worker status is still "open". Any other
-                # status (trail/loss/profit/reversed/session_end) is terminal — including
-                # "trail" here was a refactor bug that caused already-closed trades to be
-                # restored as Unit, then immediately re-closed via _sync_worker_state,
-                # double-booking pnl into trades.jsonl + monthly_summary.
-                open_trades = sorted(
-                    [t for t in history if isinstance(t, dict)
-                     and t.get("status") == "open"
-                     and t.get("id", 0) > cutoff_ms],
-                    key=lambda t: t["id"]
-                )
-                # One-shot clean-start escape hatch: MTX_SKIP_RESTORE=1 forces a flat
-                # boot (skip restoring Worker-open trades) so phantom units from a prior
-                # bad session aren't pulled back in. Still advances last_seen_id so the
-                # poll loop won't re-fire already-seen signals.
+                # Reconcile local mtx_state.json vs Worker history to decide what to
+                # restore. Local file = what the bot ACTUALLY opened; Worker = what
+                # signals fired. Divergence (phantom = Worker-open but no local record)
+                # is the bug being fixed: those are lock-refused / HALF_SIZE-skipped
+                # units the bot never filled, so we must NOT restore them as positions.
+                local_units = load_mtx_state(str(MTX_STATE_PATH))
                 skip_restore = os.getenv("MTX_SKIP_RESTORE", "0") == "1"
-                if open_trades and not skip_restore:
-                    mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
-                    for trade in open_trades[:mtx_cap]:
-                        trade = self._normalize(trade, "mtx")
-                        logger.info(f"Startup: restoring MTX state id={trade['id']} dir={trade['dir']} (no order placed)")
-                        self._open_unit(trade, source="mtx", notify=False, place_order=False)
-                    self._last_seen_id["mtx"] = open_trades[-1]["id"]
-                    logger.info(f"Startup: {len(self._units['mtx'])} MTX unit(s) state restored")
-                else:
+                if skip_restore:
                     self._last_seen_id["mtx"] = history[0]["id"]
-                    logger.info(f"Startup: MTX no restore (skip={skip_restore}, open={len(open_trades)}), last id={self._last_seen_id['mtx']}")
+                    logger.info(f"Startup: MTX SKIP_RESTORE — flat boot, last id={self._last_seen_id['mtx']}")
+                else:
+                    rec = reconcile_restore(local_units, history, cutoff_ms)
+                    mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
+                    for u in rec["to_restore"][:mtx_cap]:
+                        u = self._normalize(u, "mtx")
+                        logger.info(f"Startup: restoring MTX id={u['id']} dir={u['dir']} "
+                                    f"(local-confirmed, no order placed)")
+                        self._open_unit(u, source="mtx", notify=False, place_order=False)
+                    for unit, worker in rec["to_record_exit"]:
+                        self._record_missed_exit(unit, worker)
+                    for pid in rec["skipped_phantoms"]:
+                        logger.warning(f"Startup: SKIP phantom MTX id={pid} "
+                                       f"(Worker-open but bot never filled — not restored)")
+                    if rec["dropped_stale"]:
+                        logger.info(f"Startup: dropped {len(rec['dropped_stale'])} stale local MTX unit(s)")
+                    self._save_mtx_state()   # persist the reconciled set (drops recorded-exit + stale)
+                    self._last_seen_id["mtx"] = history[0]["id"]
+                    logger.info(f"Startup: MTX restored {len(self._units['mtx'])}, "
+                                f"recorded {len(rec['to_record_exit'])} missed-exit, "
+                                f"skipped {len(rec['skipped_phantoms'])} phantom")
         except Exception as e:
             logger.warning(f"Startup MTX fetch failed: {e}")
 
@@ -765,6 +768,39 @@ class MTXStrategy:
             save_mtx_state(str(MTX_STATE_PATH), self._units.get("mtx", []))
         except Exception as e:
             logger.error(f"MTX state save failed: {e}")
+
+    def _record_missed_exit(self, unit: dict, worker: dict) -> None:
+        """A locally-held MTX unit the Worker shows already closed (exited while the bot
+        was down). Record the trade once; do NOT restore it as open (no double-count)."""
+        exit_price = worker.get("exit", worker.get("exitPrice"))
+        reason = worker.get("status", "session_end")
+        entry = unit.get("entry")
+        # Compute pnl_pts from entry/exit if both numeric; fallback to 0.0
+        try:
+            if entry is not None and exit_price is not None:
+                raw = float(exit_price) - float(entry)
+                pnl_pts = raw if unit.get("dir") == "long" else -raw
+            else:
+                pnl_pts = 0.0
+        except (TypeError, ValueError):
+            pnl_pts = 0.0
+        try:
+            self._record_trade(
+                source="mtx",
+                label=unit.get("sig_label", unit.get("label", "")),
+                dir_=unit.get("dir", ""),
+                entry=entry,
+                exit_price=exit_price,
+                stop=unit.get("stop"),
+                target=unit.get("target"),
+                pnl_pts=pnl_pts,
+                reason=reason,
+                sig_id=unit.get("id"),
+                opened_at_ms=unit.get("opened_at"),
+            )
+            logger.info(f"Startup: recorded missed MTX exit id={unit.get('id')} reason={reason}")
+        except Exception as e:
+            logger.warning(f"Startup: missed-exit record failed id={unit.get('id')}: {e}")
 
     def _expected_net_position(self) -> int:
         """Trader's expected signed net lots = sum across all source unit lists."""
