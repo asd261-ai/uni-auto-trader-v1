@@ -31,11 +31,13 @@ class SessionSummaryActionTest(unittest.TestCase):
         a = st.session_summary_action("break", "break", "day", 1300.0, 1300.0, DELAY)
         self.assertEqual(a["fire"], "day")
         self.assertIsNone(a["pending_session"])
+        self.assertEqual(a["due_at"], 0.0)
 
     def test_poll_after_due_fires(self):
         a = st.session_summary_action("break", "break", "day", 1300.0, 9999.0, DELAY)
         self.assertEqual(a["fire"], "day")
         self.assertIsNone(a["pending_session"])
+        self.assertEqual(a["due_at"], 0.0)
 
     def test_no_transition_nothing_pending_noop(self):
         a = st.session_summary_action("day", "day", None, 0.0, 1000.0, DELAY)
@@ -50,5 +52,10 @@ class SessionSummaryActionTest(unittest.TestCase):
 
     def test_break_to_day_no_summary(self):
         a = st.session_summary_action("break", "day", None, 0.0, 1000.0, DELAY)
+        self.assertIsNone(a["fire"])
+        self.assertIsNone(a["pending_session"])
+
+    def test_break_to_night_no_summary(self):
+        a = st.session_summary_action("break", "night", None, 0.0, 1000.0, DELAY)
         self.assertIsNone(a["fire"])
         self.assertIsNone(a["pending_session"])
