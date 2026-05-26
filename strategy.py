@@ -14,6 +14,7 @@ import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
 from session_timing import session_summary_action
+from exit_reason import stop_hit_reason
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
@@ -1416,14 +1417,14 @@ class MTXStrategy:
         if unit["dir"] == "long":
             if unit["stop"] and price <= unit["stop"]:
                 logger.info(f"Stop hit | source={source} id={unit['id']} price={price} stop={unit['stop']}")
-                self._close_unit(unit, "loss", exit_price=price)
+                self._close_unit(unit, stop_hit_reason("long", unit["stop"], unit["entry"]), exit_price=price)
             elif unit["target"] and price >= unit["target"]:
                 logger.info(f"Target hit | source={source} id={unit['id']} price={price} target={unit['target']}")
                 self._close_unit(unit, "profit", exit_price=price)
         elif unit["dir"] == "short":
             if unit["stop"] and price >= unit["stop"]:
                 logger.info(f"Stop hit | source={source} id={unit['id']} price={price} stop={unit['stop']}")
-                self._close_unit(unit, "loss", exit_price=price)
+                self._close_unit(unit, stop_hit_reason("short", unit["stop"], unit["entry"]), exit_price=price)
             elif unit["target"] and price <= unit["target"]:
                 logger.info(f"Target hit | source={source} id={unit['id']} price={price} target={unit['target']}")
                 self._close_unit(unit, "profit", exit_price=price)
