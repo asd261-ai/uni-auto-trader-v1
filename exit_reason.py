@@ -10,7 +10,10 @@ semantics (worker/index.js).
 
 def stop_hit_reason(direction: str, stop: float, entry: float) -> str:
     """Return "trail" if the stop has been trailed onto entry's profit side,
-    else "loss". Breakeven (stop == entry) counts as "loss"."""
+    else "loss". Breakeven (stop == entry) counts as "loss". A missing/zero
+    entry degrades to "loss" (old behavior) rather than raising."""
+    if not entry:
+        return "loss"
     if direction == "long":
         return "trail" if stop > entry else "loss"
     return "trail" if stop < entry else "loss"

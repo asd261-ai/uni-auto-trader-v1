@@ -25,6 +25,12 @@ class StopHitReasonTest(unittest.TestCase):
     def test_short_breakeven_is_loss(self):
         self.assertEqual(stop_hit_reason("short", 44219, 44219), "loss")
 
+    def test_none_entry_degrades_to_loss(self):
+        self.assertEqual(stop_hit_reason("short", 44151, None), "loss")
+
+    def test_zero_entry_degrades_to_loss(self):
+        self.assertEqual(stop_hit_reason("long", 44050, 0), "loss")
+
 
 if __name__ == "__main__":
     unittest.main()
