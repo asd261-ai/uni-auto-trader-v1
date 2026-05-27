@@ -15,6 +15,7 @@ import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no exec
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
+from atr_gate import should_skip_code4_atr
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
@@ -80,6 +81,18 @@ REGIME_CACHE_SEC           = int(os.getenv("REGIME_CACHE_SEC", "300"))  # re-rea
 # have no positive edge across 5/6 months; this trims that bleed while keeping
 # optionality (vs a full cut). Set via .env e.g. HALF_SIZE_CODES=3,4 ; empty → off.
 HALF_SIZE_CODES = {int(c) for c in os.getenv("HALF_SIZE_CODES", "").split(",") if c.strip().isdigit()}
+
+# Code-4 ATR-gated skip (manual switch; default OFF).
+# When set, ④ 轉弱賣出 signals with ATR > threshold are silent-absorbed
+# (skipped, no order). Backtest 5/22-5/27 (n=15 ④, n=6 ATR>58) showed
+# +348 pts (NTD +17,400) lift. Other codes (⑧/③) have opposite ATR direction
+# so this rule is intentionally ④-only. Fail-open on missing ATR.
+# Set via .env MTX_SKIP_CODE_4_ATR_GT=58 ; unset/0 → disabled.
+# Spec: docs/superpowers/specs/2026-05-27-mtx-skip-code4-high-atr.md
+try:
+    SKIP_CODE_4_ATR_GT = int(os.getenv("MTX_SKIP_CODE_4_ATR_GT", "0") or "0")
+except (ValueError, TypeError):
+    SKIP_CODE_4_ATR_GT = 0
 
 POLL_INTERVAL = 3     # seconds
 SESSION_SUMMARY_DELAY_SEC = 300   # delay session-close summary so bell/session_end trades settle
@@ -1169,6 +1182,23 @@ class MTXStrategy:
                     continue
                 # 'undefined' fails-open: if no daily_closes.json or insufficient
                 # history, we DON'T block (safer when data is unavailable)
+
+            # Code-4 ATR-gated skip (env-gated; default OFF). Fires BEFORE HALF_SIZE
+            # so ATR-skipped signals don't increment the half-size counter. Pure
+            # function in atr_gate.py handles validity (fail-open on missing atr,
+            # code-specific to ④, threshold ≤0 = disabled). Spec:
+            # docs/superpowers/specs/2026-05-27-mtx-skip-code4-high-atr.md
+            if source == "mtx" and direction == "short":
+                _sig_code = int(trade.get("sigCode") or 0)
+                _sig_atr  = trade.get("atr")
+                if should_skip_code4_atr(_sig_code, _sig_atr, SKIP_CODE_4_ATR_GT):
+                    logger.info(
+                        f"MTX code-4 ATR-gated skip | atr={_sig_atr} > "
+                        f"threshold={SKIP_CODE_4_ATR_GT} id={trade_id} "
+                        f"entry={trade.get('entry')}"
+                    )
+                    self._last_seen_id[source] = trade_id
+                    continue
 
             # Half-size skip-alternate (manual switch; default OFF). For MTX SHORT
             # signals whose code is in HALF_SIZE_CODES, silent-absorb every 2nd one
