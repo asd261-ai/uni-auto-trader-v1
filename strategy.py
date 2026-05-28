@@ -1197,6 +1197,18 @@ class MTXStrategy:
                         f"threshold={SKIP_CODE_4_ATR_GT} id={trade_id} "
                         f"entry={trade.get('entry')}"
                     )
+                    # Real-time Telegram via Health Bot channel (avoid polluting
+                    # MTX_Monitor trade-signal stream). Per Sean 5/28 design choice
+                    # for Phase 2 observation visibility — catch unexpected fires.
+                    # After ≥6-week promotion (~7/8), may downgrade to session
+                    # summary only.
+                    _atr_skip_msg = (
+                        f"🚫 ATR Skip | ④ short atr={_sig_atr} > {SKIP_CODE_4_ATR_GT}"
+                        f"\nentry={trade.get('entry')} id={trade_id}"
+                    )
+                    threading.Thread(
+                        target=self._safe_health_notify, args=(_atr_skip_msg,), daemon=True
+                    ).start()
                     self._last_seen_id[source] = trade_id
                     continue
 

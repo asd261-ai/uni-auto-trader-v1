@@ -86,8 +86,12 @@ the other.
 ### 3.4 Logging
 
 - INFO level: `MTX code-4 ATR-gated skip | atr=X > threshold=Y id=Z entry=P`
-- No Telegram notification (silent skip, matches HALF_SIZE pattern —
-  avoid alert spam, only fire on actual order sends).
+- **Telegram notification (2026-05-28 PM update)**: each skip fires
+  `🚫 ATR Skip | ④ short atr=X > Y\nentry=P id=Z` via `_safe_health_notify`
+  (Health Bot channel, separate from MTX_Monitor trade stream). Threaded
+  send to avoid blocking poll loop. Rationale: Phase 2 observation period
+  benefits from real-time visibility to catch unexpected fire patterns.
+  May downgrade to session-summary after ≥6-week promotion review (~7/8).
 - No state file change (skip = no unit opened = no `mtx_state.json` write).
 - Skip events are derivable from journal grep for post-hoc analysis.
 
