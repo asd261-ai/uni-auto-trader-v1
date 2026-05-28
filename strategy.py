@@ -1183,19 +1183,23 @@ class MTXStrategy:
                 # 'undefined' fails-open: if no daily_closes.json or insufficient
                 # history, we DON'T block (safer when data is unavailable)
 
-            # Code-4 ATR-gated skip (env-gated; default OFF). Fires BEFORE HALF_SIZE
-            # so ATR-skipped signals don't increment the half-size counter. Pure
-            # function in atr_gate.py handles validity (fail-open on missing atr,
-            # code-specific to ④, threshold ≤0 = disabled). Spec:
+            # Code-4 ATR-gated skip (env-gated; default OFF; **night-only**
+            # since 2026-05-28). Fires BEFORE HALF_SIZE so ATR-skipped signals
+            # don't increment the half-size counter. Pure function in atr_gate.py
+            # handles validity (fail-open on missing atr, code-specific to ④,
+            # session-conditional, threshold ≤0 = disabled). Spec:
             # docs/superpowers/specs/2026-05-27-mtx-skip-code4-high-atr.md
+            # (section 3 updated 5/28 for night-only refinement; counterfactual
+            # showed day-session ATR>58 trades net +78 pts edge, only night
+            # cluster was net negative).
             if source == "mtx" and direction == "short":
                 _sig_code = int(trade.get("sigCode") or 0)
                 _sig_atr  = trade.get("atr")
-                if should_skip_code4_atr(_sig_code, _sig_atr, SKIP_CODE_4_ATR_GT):
+                if should_skip_code4_atr(_sig_code, _sig_atr, SKIP_CODE_4_ATR_GT, self._current_session):
                     logger.info(
                         f"MTX code-4 ATR-gated skip | atr={_sig_atr} > "
-                        f"threshold={SKIP_CODE_4_ATR_GT} id={trade_id} "
-                        f"entry={trade.get('entry')}"
+                        f"threshold={SKIP_CODE_4_ATR_GT} session={self._current_session} "
+                        f"id={trade_id} entry={trade.get('entry')}"
                     )
                     # Real-time Telegram via Health Bot channel (avoid polluting
                     # MTX_Monitor trade-signal stream). Per Sean 5/28 design choice
@@ -1204,6 +1208,7 @@ class MTXStrategy:
                     # summary only.
                     _atr_skip_msg = (
                         f"🚫 ATR Skip | ④ short atr={_sig_atr} > {SKIP_CODE_4_ATR_GT}"
+                        f" [{self._current_session}]"
                         f"\nentry={trade.get('entry')} id={trade_id}"
                     )
                     threading.Thread(

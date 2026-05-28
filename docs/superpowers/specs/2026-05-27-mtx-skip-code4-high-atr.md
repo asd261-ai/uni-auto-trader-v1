@@ -1,6 +1,6 @@
 # MTX Code-4 High-ATR Skip — Spec
 
-- **Status**: DRAFT (2026-05-27), not deployed, awaiting Sean go/no-go
+- **Status**: LIVE since 2026-05-27 Phase 2 deploy; **refined to night-only 2026-05-28 14:25** based on 13-event counterfactual
 - **Driver memory**: `[[project-trader-slippage-analysis]]`
 - **Related**: `[[project-mtx-loss-controls]]` (HALF_SIZE_CODES coexistence), `[[feedback-4-5month-oos]]` (sample sufficiency rule)
 
@@ -39,7 +39,27 @@ The fix must be **code-specific to ④**.
 
 ## 3. Design
 
-### 3.1 Env var (new)
+### 3.0 Night-only refinement (2026-05-28 14:25)
+
+After 13 LIVE skip events (5/27 17:30 → 5/28 14:00), per-trade counterfactual
+via Worker history revealed the **session-asymmetry**:
+
+| Session | n | Sum signal pnl (if not skipped) | Interpretation |
+|---|---|---|---|
+| Night (5/27 21:32-23:44) | 8 | **−103** | Gate AVOIDED LOSSES (good) |
+| Day (5/28 09:00-11:14) | 5 | **+78** | Gate CUT WINNERS (bad) |
+| **Total** | 13 | −25 | Marginal |
+
+Day-session ④ × ATR>58 actually has +edge (small but real). Skipping it cuts
+genuine winners (e.g. 5/28 11:14 ④ short would have been +232 profit).
+
+Therefore the gate is **refined to fire only when session == "night"**.
+Day-session ④ × High-ATR continues to trade.
+
+Function signature change: `should_skip_code4_atr(sig_code, sig_atr, threshold, session)`.
+strategy.py passes `self._current_session` at the check point.
+
+### 3.1 Env var (existing)
 
 - `MTX_SKIP_CODE_4_ATR_GT`: integer, optional, **default unset**
   - **Unset** (or empty / ≤0): no behavior change. Backwards-compat.
