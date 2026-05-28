@@ -45,8 +45,25 @@ if DRY_RUN:
     strategy.start()
     logging.info("Running in DRY RUN mode (no login, no real orders)")
 else:
-    trader.start()
-    strategy.start()
+    # Wrap startup: any failure here (Login failed, contract resolve failed,
+    # subscribe failed before the warn-only branch, etc.) MUST cause the process
+    # to exit cleanly, not propagate as an uncaught exception. The unitrade SDK
+    # C-extension keeps the process PID alive after the Python main thread dies,
+    # leaving a zombie that systemd cannot detect (state stays active) and
+    # cannot restart (Restart=always only fires on actual process exit).
+    # os._exit(1) terminates immediately at the OS level — C-ext threads die
+    # with the process, systemd sees a clean failure, Restart=always kicks in
+    # after RestartSec=15.
+    # See docs/superpowers/specs/2026-05-28-main-try-except-zombie-prevention.md
+    # and [[feedback-trader-weekend-restart-zombie]] for the 5/23 incident and
+    # 5/27 reproduction that motivated this fix.
+    try:
+        trader.start()
+        strategy.start()
+    except Exception as e:
+        logging.exception(f"trader/strategy startup failed — exiting for systemd restart: {e}")
+        import os as _os
+        _os._exit(1)
 
 while True:
     time.sleep(1)
