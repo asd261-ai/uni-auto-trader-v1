@@ -16,6 +16,7 @@ from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
 from atr_gate import should_skip_code4_atr
+from open_freeze import in_open_freeze_window
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
@@ -93,6 +94,18 @@ try:
     SKIP_CODE_4_ATR_GT = int(os.getenv("MTX_SKIP_CODE_4_ATR_GT", "0") or "0")
 except (ValueError, TypeError):
     SKIP_CODE_4_ATR_GT = 0
+
+# Session-open trading freeze (Sean 2026-05-30). FULL freeze: no entry AND no exit
+# in the first OPEN_FREEZE_SECS after a session open (day 08:45, night 15:00 TW) —
+# sit out the opening spike. Gates entry/reversal, tick exits, and Worker-driven
+# exits. Trade-off (accepted): software stop-loss is OFF during the window, so a
+# gap-and-go can exit worse than the stop. Default 300 (5 min, ON); 0 disables.
+# Phase-0 (2026-05-30) showed 0/322 real trades currently land in-window, so this
+# is a forward guardrail — a no-op until a signal ever fires/exits at the open.
+try:
+    OPEN_FREEZE_SECS = int(os.getenv("OPEN_FREEZE_SECS", "300") or "0")
+except (ValueError, TypeError):
+    OPEN_FREEZE_SECS = 0
 
 POLL_INTERVAL = 3     # seconds
 SESSION_SUMMARY_DELAY_SEC = 300   # delay session-close summary so bell/session_end trades settle
@@ -455,10 +468,23 @@ class MTXStrategy:
         else:
             logger.info("Reconnect: no open position, no action needed")
 
+    # ── Session-open freeze 判定 ──────────────────────────────────
+
+    def _in_open_freeze(self) -> bool:
+        """True during the session-open trading freeze (first OPEN_FREEZE_SECS of
+        the day/night open). When True, ALL order paths are suppressed — entry,
+        reversal, tick exit, and Worker-driven exit. See open_freeze.py."""
+        return in_open_freeze_window(datetime.now(TZ_TW), OPEN_FREEZE_SECS)
+
     # ── 行情 tick 回調 ────────────────────────────────────────────
 
     def on_tick(self, price: float):
         self._tick_wd.record_tick(time.time())   # stamp BEFORE the flat early-return below
+        # Session-open freeze: skip exit checks too (carried position waits out the
+        # opening spike). Watchdog stamp above is kept so the freeze doesn't look
+        # like a dead feed. Stop-loss is intentionally dormant during the window.
+        if self._in_open_freeze():
+            return
         with self._lock:
             all_units = self._flatten_units()
             if not all_units:
@@ -1134,6 +1160,18 @@ class MTXStrategy:
                 self._last_seen_id[source] = trade_id
                 continue
 
+            # Session-open freeze: no entry/reversal in the first OPEN_FREEZE_SECS
+            # of a session open (Sean 2026-05-30). Silent-absorb (consume) the
+            # signal — skip, not defer, so we don't chase a stale entry once the
+            # window clears. Covers MTX + FVG, new entries + reversals + pyramids.
+            if self._in_open_freeze():
+                logger.info(
+                    f"Session-open freeze | {source} entry {trade_id} silent-absorbed "
+                    f"(first {OPEN_FREEZE_SECS}s of session open)"
+                )
+                self._last_seen_id[source] = trade_id
+                continue
+
             # FVG consumer-side boot floor: silent-absorb stale KV `status=open`
             # signals replayed at boot. Without this, restart re-fires any FVG
             # signal the producer never closed (e.g. producer-crash leftovers),
@@ -1294,6 +1332,18 @@ class MTXStrategy:
             with self._lock:
                 if unit not in self._units.get(source, []):
                     continue  # closed during this iteration
+
+                # Session-open freeze: defer Worker-driven CLOSES during the window
+                # (carried position waits out the opening spike). Trailing-stop level
+                # syncs below place no order, so they're still allowed; the close is
+                # re-evaluated on the next poll once the window clears.
+                if self._in_open_freeze() and status in (
+                        "loss", "profit", "trail", "reversed", "session_end"):
+                    logger.info(
+                        f"Session-open freeze | {source} Worker exit ({status}) deferred "
+                        f"id={unit['id']} (first {OPEN_FREEZE_SECS}s of session open)"
+                    )
+                    continue
 
                 if status == "loss":
                     pnl        = our_trade.get("pnl") or 0
