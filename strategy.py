@@ -13,6 +13,7 @@ import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
+from margin_headroom import headroom_low
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
 from atr_gate import should_skip_code4_atr
@@ -144,6 +145,11 @@ MTX_STATE_PATH       = Path(__file__).parent / "mtx_state.json"
 RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
 RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
 
+# Shared-account margin headroom: alert when available order-excess margin
+# (DMargin.twdordexcess) drops below the floor the bot needs to keep placing
+# MXF orders (FUF1239 rejection threshold). 0 disables (no redeploy needed).
+MARGIN_HEADROOM_MIN_TWD = float(os.getenv("MARGIN_HEADROOM_MIN_TWD", "100000"))
+
 # Tick-stale watchdog: detect when the dquote tick feed silently stops (alive but blind).
 TICK_STALE_DAY_SEC      = int(os.getenv("TICK_STALE_DAY_SEC", "90"))     # liquid day session
 TICK_STALE_NIGHT_SEC    = int(os.getenv("TICK_STALE_NIGHT_SEC", "300"))  # thin night session
@@ -274,6 +280,9 @@ class MTXStrategy:
         self._recon_schema_alert_sent: bool                 = False  # one-shot dedup for SDK schema drift
         self._recon_last_broker_net: Optional[int]          = None   # last observed broker signed net (for heartbeat)
         self._recon_last_expected:   Optional[int]          = None   # last computed expected signed net
+        # Shared-account margin headroom monitor (alert-only, never touches orders)
+        self._margin_last_check:     float                  = 0.0    # epoch s of last get_margin
+        self._margin_alert_sent:     bool                   = False  # one-shot dedup latch
 
         # Tick-stale watchdog: detect when the dquote tick feed silently stops delivering
         # (trader alive but blind to price → exits won't fire). Alert-only; see tick_watchdog.py.
@@ -590,6 +599,11 @@ class MTXStrategy:
                 self._check_broker_reconciliation()
             except Exception as e:
                 logger.debug(f"recon error (silent): {e}")
+            # Shared-account margin-headroom monitor (alert-only, ~1 min throttle internally)
+            try:
+                self._check_margin_headroom()
+            except Exception as e:
+                logger.debug(f"margin headroom error (silent): {e}")
             # Tick-stale watchdog: detect if the dquote feed goes silent during an active
             # session (self-throttled + session/weekend-gated inside check()).
             # PHASE 1 (observe-only): route alerts to the log, NOT Telegram — validates
@@ -998,6 +1012,59 @@ class MTXStrategy:
                 f"建議:檢查是否 FVG bot engine 漏 close 訊號(見 [[feedback-fvg-engine-multi-open-bug]]),"
                 f"或執行 /flat-position skill 手動對齊"
             )
+
+    def _check_margin_headroom(self):
+        """Shared-account margin-headroom safety net (alert-only).
+
+        Account 0239174 is shared with Sean's manual trades. When his manual
+        positions drain the account's available order-excess margin, the bot's
+        MXF orders get rejected by the broker (FUF1239). This periodically reads
+        the broker's available order-excess margin (DMargin.twdordexcess) and
+        warns the Health bot when it falls below MARGIN_HEADROOM_MIN_TWD, so Sean
+        can top up / trim before the bot silently misses entries.
+
+        READ-ONLY — never touches orders or _units. Same gating/cadence as recon
+        (skip break/weekend, ~1 min throttle). One-shot dedup + recovery notify.
+        See [[project-shared-account-margin-contention]].
+        """
+        if MARGIN_HEADROOM_MIN_TWD <= 0:   # feature disabled
+            return
+        if self._current_session not in ("day", "night"):
+            return
+        if datetime.now(TZ_TW).weekday() >= 5:  # 5=Sat, 6=Sun
+            return
+        now = time.time()
+        if now - self._margin_last_check < RECON_CHECK_INTERVAL_SEC:
+            return
+        self._margin_last_check = now
+
+        excess = self.trader._query_broker_margin_excess("TWD")
+        if excess is None:
+            # No reliable read — fail-safe, do NOT alert and do NOT clear latch.
+            logger.debug("margin headroom: no reliable read this cycle")
+            return
+
+        if headroom_low(excess, MARGIN_HEADROOM_MIN_TWD):
+            if not self._margin_alert_sent:
+                self._margin_alert_sent = True
+                logger.warning(
+                    f"MARGIN_HEADROOM_LOW: ordexcess={excess:.0f} "
+                    f"floor={MARGIN_HEADROOM_MIN_TWD:.0f}"
+                )
+                self._safe_health_notify(
+                    f"⚠️ <b>可用保證金 headroom 不足</b>\n"
+                    f"可委託超額保證金剩 <b>NT${excess:,.0f}</b>(門檻 NT${MARGIN_HEADROOM_MIN_TWD:,.0f})\n"
+                    f"bot 新單恐被 FUF1239 拒(共用帳號保證金競爭)。\n"
+                    f"請入金或減少手動部位以恢復 headroom。"
+                )
+        else:
+            if self._margin_alert_sent:
+                self._margin_alert_sent = False
+                logger.info(f"margin headroom recovered: ordexcess={excess:.0f}")
+                self._safe_health_notify(
+                    f"✅ <b>保證金 headroom 已恢復</b>\n"
+                    f"可委託超額保證金 <b>NT${excess:,.0f}</b>(門檻 NT${MARGIN_HEADROOM_MIN_TWD:,.0f})"
+                )
 
     def _check_trading_day_reset(self):
         """Reset daily P&L counter when trading day flips (08:45 TW).

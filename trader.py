@@ -195,6 +195,43 @@ class AutoTrader:
             logger.error(f"Position query failed: {e}")
         return None
 
+    def _query_broker_margin_excess(self, currency: str = "TWD"):
+        """Available order-excess margin (DMargin.twdordexcess) in NT$, or None.
+
+        This is the figure the broker checks for FUF1239 ("未沖銷部位及委託保證金
+        超過使用額度") — when it drops below a new order's requirement the order
+        is rejected. On a shared account, Sean's manual positions can drain it
+        below what the bot needs.
+
+        SDK signature: daccount.get_margin(actno, currency) -> DMarginResponse
+        (ok, error, data=List[DMargin]). READ-ONLY: reuses the already-logged-in
+        api session — never re-logs-in (a second session on the shared account
+        could disturb the live trader).
+
+        Returns None on any failure / unexpected shape (caller treats None as
+        "no reliable read" and does NOT alert — fail-safe).
+        """
+        try:
+            resp = self.api.daccount.get_margin(self.actno, currency)
+            if not resp or not getattr(resp, "ok", False):
+                err = getattr(resp, "error", "unknown") if resp else "no response"
+                logger.debug(f"Margin query: broker not ok ({err})")
+                return None
+            data = getattr(resp, "data", None)
+            if data is None:
+                return None
+            items = data if isinstance(data, (list, tuple)) else [data]
+            for m in items:
+                val = getattr(m, "twdordexcess", None)
+                if val is None:
+                    val = getattr(m, "ordcexcess", None)  # original-currency fallback
+                if val is not None:
+                    return float(val)
+            return None
+        except Exception as e:
+            logger.debug(f"Margin query failed (silent): {e}")
+        return None
+
     # ── 下單工具 ──────────────────────────────────────────────────
 
     def buy(self, productid: str, qty: int, ordertype: str = "M", price: float = 0, opencloseflag: str = ""):
