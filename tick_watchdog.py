@@ -119,14 +119,15 @@ class TickStaleWatchdog:
         # kill-tier: escalate a sustained outage to a process exit so systemd restarts
         # and the OS reclaims leaked fds. Gated by the same active-session check above,
         # plus a longer threshold and a process-uptime grace (anti self-kill-loop).
-        # Use raw tick age (not session-grace-adjusted) so a pre-existing stale tick is
-        # visible even on the first check() call into a session.
+        # Uses the SAME session-grace-anchored `age` as the alert tier: once a session has
+        # been delivering ticks, _last_tick_ts > _active_session_since so age == real
+        # staleness; the anchor only diverges at session open, where it (correctly) prevents
+        # a false kill from a prior-session stale tick before the first tick arrives.
         if on_kill is not None and uptime is not None and uptime > self.kill_grace:
             kill_threshold = self.kill_day_threshold if session == "day" else self.kill_night_threshold
-            kill_age = (now - self._last_tick_ts) if self._last_tick_ts else age
-            if kill_age > kill_threshold and not self._kill_fired:
+            if age > kill_threshold and not self._kill_fired:
                 on_kill(
-                    f"TICK FEED STALE {kill_age:.0f}s > kill {kill_threshold:.0f}s "
+                    f"TICK FEED STALE {age:.0f}s > kill {kill_threshold:.0f}s "
                     f"(session={session}, uptime={uptime:.0f}s) — escalating to process exit "
                     f"for systemd restart (fd reclaim)."
                 )

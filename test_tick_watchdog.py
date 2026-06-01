@@ -148,12 +148,20 @@ class KillTier(unittest.TestCase):
             kill_day_threshold=180.0, kill_night_threshold=600.0, kill_grace=120.0,
         )
 
+    # NOTE: the kill-tier uses the same session-grace-anchored `age` as the alert tier.
+    # On the FIRST check() that enters an active session, the grace anchor is set to `now`
+    # so age == 0 — you must call check() once to enter the session, THEN advance `now`
+    # (without a tick) to accumulate real staleness. This mirrors live behaviour and
+    # guards against a false kill at session open from a prior-session stale tick.
+
     def test_kill_fires_when_stale_beyond_kill_threshold_and_past_grace(self):
         wd = self._wd()
         kills = []
         wd.record_tick(1000)
-        # age 200s > kill 180s, uptime 500s > grace 120s, day session
-        wd.check(1200, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)
+        wd.check(1000, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)  # enter session
+        self.assertEqual(kills, [])
+        # 200s later, still no tick → age 200 > kill 180, uptime > grace
+        wd.check(1200, "day", False, lambda m: None, uptime=700.0, on_kill=kills.append)
         self.assertEqual(len(kills), 1)
         self.assertIn("escalating", kills[0])
 
@@ -161,43 +169,53 @@ class KillTier(unittest.TestCase):
         wd = self._wd()
         kills = []
         wd.record_tick(1000)
-        wd.check(1200, "day", False, lambda m: None, uptime=60.0, on_kill=kills.append)
+        wd.check(1000, "day", False, lambda m: None, uptime=60.0, on_kill=kills.append)
+        wd.check(1200, "day", False, lambda m: None, uptime=60.0, on_kill=kills.append)  # uptime < grace
         self.assertEqual(kills, [])
 
     def test_kill_not_fired_below_kill_threshold(self):
         wd = self._wd()
         kills = []
         wd.record_tick(1000)
-        # age 100s < kill 180s (alert fires at 90s but kill does not)
-        wd.check(1100, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)
+        wd.check(1000, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)  # enter session
+        # age 100s < kill 180s (alert tier fires at 90s but kill does not)
+        wd.check(1100, "day", False, lambda m: None, uptime=600.0, on_kill=kills.append)
         self.assertEqual(kills, [])
 
     def test_kill_skipped_on_break_and_weekend(self):
         wd = self._wd()
         kills = []
         wd.record_tick(1000)
-        wd.check(1300, "break", False, lambda m: None, uptime=500.0, on_kill=kills.append)
-        wd.check(1300, "day", True, lambda m: None, uptime=500.0, on_kill=kills.append)
+        wd.check(1300, "break", False, lambda m: None, uptime=500.0, on_kill=kills.append)  # break → gated
+        wd.check(1400, "day", True, lambda m: None, uptime=500.0, on_kill=kills.append)     # weekend → gated
         self.assertEqual(kills, [])
 
     def test_kill_one_shot_until_recovery(self):
         wd = self._wd()
         kills = []
         wd.record_tick(1000)
-        wd.check(1200, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)
-        wd.check(1240, "day", False, lambda m: None, uptime=540.0, on_kill=kills.append)
-        self.assertEqual(len(kills), 1)            # latched, not re-fired
-        wd.record_tick(1240)                       # feed recovers
-        wd.check(1241, "day", False, lambda m: None, uptime=541.0, on_kill=kills.append)
-        wd.record_tick(1241)
-        wd.check(1500, "day", False, lambda m: None, uptime=800.0, on_kill=kills.append)
-        # stale again after recovery → kill may fire again
+        wd.check(1000, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)  # enter session
+        wd.check(1200, "day", False, lambda m: None, uptime=700.0, on_kill=kills.append)  # age 200 → kill #1
+        wd.check(1240, "day", False, lambda m: None, uptime=740.0, on_kill=kills.append)  # latched
+        self.assertEqual(len(kills), 1)
+        wd.record_tick(1240)                                                               # feed recovers → re-arm
+        wd.check(1280, "day", False, lambda m: None, uptime=780.0, on_kill=kills.append)  # age 40 → healthy
+        wd.check(1500, "day", False, lambda m: None, uptime=1000.0, on_kill=kills.append) # age 260 → kill #2
         self.assertEqual(len(kills), 2)
+
+    def test_kill_does_not_false_fire_at_session_open_with_ancient_prior_tick(self):
+        # Regression: prior tick is hours old (previous session) but entering a fresh active
+        # session re-anchors the grace clock, so kill must NOT fire on the open check.
+        wd = self._wd()
+        kills = []
+        wd.record_tick(1000)
+        wd.check(100000, "day", False, lambda m: None, uptime=100000.0, on_kill=kills.append)
+        self.assertEqual(kills, [])
 
     def test_kill_noop_when_callback_or_uptime_absent(self):
         wd = self._wd()
         wd.record_tick(1000)
-        wd.check(1200, "day", False, lambda m: None)                 # no on_kill / uptime
+        wd.check(1000, "day", False, lambda m: None)                 # no on_kill / uptime
         wd.check(1200, "day", False, lambda m: None, uptime=500.0)   # no on_kill
         # no exception, nothing to assert beyond "did not raise"
 
