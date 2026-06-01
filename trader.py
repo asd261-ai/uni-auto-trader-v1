@@ -4,6 +4,7 @@ import os
 from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 import order_log
 from feed_schema import parse_broker_position, parse_fill, SCHEMA_FAIL
+from order_reject import is_reject_status
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,11 @@ class AutoTrader:
         logger.info(f"Reply | {reply.productid} {reply.bs} status={reply.orderstatus} orderno={reply.orderno}")
         order_log.log_event("reply", productid=reply.productid, bs=reply.bs,
                             orderno=reply.orderno, orderstatus=reply.orderstatus)
+        if self.strategy and is_reject_status(reply.orderstatus):
+            try:
+                self.strategy.on_order_rejected(reply.productid, reply.bs, reply.orderstatus)
+            except Exception as e:
+                logger.debug(f"on_order_rejected error (non-fatal): {e}")
 
     def _on_match(self, match):
         # Schema gate: reject malformed fills before they reach the P&L log or the

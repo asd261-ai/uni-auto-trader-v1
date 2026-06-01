@@ -20,6 +20,7 @@ from open_freeze import in_open_freeze_window
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
+import order_reject
 
 logger = logging.getLogger(__name__)
 
@@ -526,6 +527,20 @@ class MTXStrategy:
                         f"anchor={'on' if self._fill_anchor else 'off'}")
             if self._fill_anchor and pend["source"] == "mtx":
                 fill_emit.send({"source": "mtx", "id": pend["id"], "fill_price": price})
+
+    def on_order_rejected(self, productid: str, bs: str, orderstatus: str):
+        """Called from trader._on_reply (broker thread) when a reply is a rejection.
+        Roll back the optimistic unit so no phantom unit / phantom P&L lingers."""
+        with self._lock:
+            unit = order_reject.rollback_rejected_entry(
+                self._pending_fills, self._units, productid, bs,
+                self.trader.config.get("product"),
+            )
+        if unit:
+            logger.warning(
+                f"[order-rejected] source={unit['source']} dir={unit['dir']} "
+                f"id={unit['id']} status={orderstatus} → unit rolled back (no fill, no P&L)"
+            )
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
 
