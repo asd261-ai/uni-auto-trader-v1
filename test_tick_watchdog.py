@@ -141,5 +141,71 @@ class Helpers(unittest.TestCase):
                 TickStaleWatchdog(**kw)
 
 
+class KillTier(unittest.TestCase):
+    def _wd(self):
+        return TickStaleWatchdog(
+            day_threshold=DAY, night_threshold=NIGHT, check_interval=IVAL,
+            kill_day_threshold=180.0, kill_night_threshold=600.0, kill_grace=120.0,
+        )
+
+    def test_kill_fires_when_stale_beyond_kill_threshold_and_past_grace(self):
+        wd = self._wd()
+        kills = []
+        wd.record_tick(1000)
+        # age 200s > kill 180s, uptime 500s > grace 120s, day session
+        wd.check(1200, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)
+        self.assertEqual(len(kills), 1)
+        self.assertIn("escalating", kills[0])
+
+    def test_kill_suppressed_within_grace(self):
+        wd = self._wd()
+        kills = []
+        wd.record_tick(1000)
+        wd.check(1200, "day", False, lambda m: None, uptime=60.0, on_kill=kills.append)
+        self.assertEqual(kills, [])
+
+    def test_kill_not_fired_below_kill_threshold(self):
+        wd = self._wd()
+        kills = []
+        wd.record_tick(1000)
+        # age 100s < kill 180s (alert fires at 90s but kill does not)
+        wd.check(1100, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)
+        self.assertEqual(kills, [])
+
+    def test_kill_skipped_on_break_and_weekend(self):
+        wd = self._wd()
+        kills = []
+        wd.record_tick(1000)
+        wd.check(1300, "break", False, lambda m: None, uptime=500.0, on_kill=kills.append)
+        wd.check(1300, "day", True, lambda m: None, uptime=500.0, on_kill=kills.append)
+        self.assertEqual(kills, [])
+
+    def test_kill_one_shot_until_recovery(self):
+        wd = self._wd()
+        kills = []
+        wd.record_tick(1000)
+        wd.check(1200, "day", False, lambda m: None, uptime=500.0, on_kill=kills.append)
+        wd.check(1240, "day", False, lambda m: None, uptime=540.0, on_kill=kills.append)
+        self.assertEqual(len(kills), 1)            # latched, not re-fired
+        wd.record_tick(1240)                       # feed recovers
+        wd.check(1241, "day", False, lambda m: None, uptime=541.0, on_kill=kills.append)
+        wd.record_tick(1241)
+        wd.check(1500, "day", False, lambda m: None, uptime=800.0, on_kill=kills.append)
+        # stale again after recovery → kill may fire again
+        self.assertEqual(len(kills), 2)
+
+    def test_kill_noop_when_callback_or_uptime_absent(self):
+        wd = self._wd()
+        wd.record_tick(1000)
+        wd.check(1200, "day", False, lambda m: None)                 # no on_kill / uptime
+        wd.check(1200, "day", False, lambda m: None, uptime=500.0)   # no on_kill
+        # no exception, nothing to assert beyond "did not raise"
+
+    def test_kill_invalid_config_rejected(self):
+        for kw in ({"kill_day_threshold": 0}, {"kill_night_threshold": -1}, {"kill_grace": 0}):
+            with self.assertRaises(ValueError):
+                TickStaleWatchdog(**kw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

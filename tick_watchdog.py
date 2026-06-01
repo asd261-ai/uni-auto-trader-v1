@@ -36,21 +36,31 @@ class TickStaleWatchdog:
         day_threshold: float = 90.0,     # liquid day session (08:45-13:45)
         night_threshold: float = 300.0,  # thin night session (15:00-05:00); allow longer gaps
         check_interval: float = 30.0,    # how often the staleness eval actually runs
+        kill_day_threshold: float = 180.0,    # escalate (os._exit) past this in day session
+        kill_night_threshold: float = 600.0,  # escalate past this in night session
+        kill_grace: float = 180.0,            # min process uptime before kill is eligible
     ) -> None:
         if day_threshold <= 0 or night_threshold <= 0 or check_interval <= 0:
             raise ValueError("thresholds and interval must be positive")
+        if kill_day_threshold <= 0 or kill_night_threshold <= 0 or kill_grace <= 0:
+            raise ValueError("kill thresholds and grace must be positive")
         self.day_threshold = float(day_threshold)
         self.night_threshold = float(night_threshold)
         self.check_interval = float(check_interval)
+        self.kill_day_threshold = float(kill_day_threshold)
+        self.kill_night_threshold = float(kill_night_threshold)
+        self.kill_grace = float(kill_grace)
         self._last_tick_ts = 0.0          # 0.0 = no tick seen yet
         self._active_session_since = 0.0  # when we last entered an active session (grace anchor)
         self._session: Optional[str] = None
         self._last_check = 0.0
         self._alert_sent = False          # one-shot latch, mirrors recon's _recon_alert_sent
+        self._kill_fired = False
 
     # ---- written from on_tick (broker thread). Plain float assignment is GIL-atomic. ----
     def record_tick(self, now: float) -> None:
         self._last_tick_ts = now
+        self._kill_fired = False  # feed alive again → re-arm kill for future outages
 
     def last_tick_age(self, now: float) -> Optional[float]:
         return (now - self._last_tick_ts) if self._last_tick_ts else None
@@ -66,6 +76,8 @@ class TickStaleWatchdog:
         session: str,
         is_weekend: bool,
         notify: Callable[[str], None],
+        uptime: Optional[float] = None,
+        on_kill: Optional[Callable[[str], None]] = None,
     ) -> None:
         # (1) session-transition grace — runs on every call, before the throttle, so we never
         #     miss a transition. Entering an active session (re)anchors the grace clock so the
@@ -99,3 +111,23 @@ class TickStaleWatchdog:
             if self._alert_sent:
                 notify(f"✅ Tick feed recovered (last tick {age:.0f}s ago).")
                 self._alert_sent = False
+            # _kill_fired is re-armed by record_tick() when the feed delivers a new tick,
+            # not here — resetting on any healthy eval would allow the kill to double-fire
+            # within the same outage episode (alert-tier age < threshold while kill-tier
+            # kill_age > kill_threshold in a transitional window).
+
+        # kill-tier: escalate a sustained outage to a process exit so systemd restarts
+        # and the OS reclaims leaked fds. Gated by the same active-session check above,
+        # plus a longer threshold and a process-uptime grace (anti self-kill-loop).
+        # Use raw tick age (not session-grace-adjusted) so a pre-existing stale tick is
+        # visible even on the first check() call into a session.
+        if on_kill is not None and uptime is not None and uptime > self.kill_grace:
+            kill_threshold = self.kill_day_threshold if session == "day" else self.kill_night_threshold
+            kill_age = (now - self._last_tick_ts) if self._last_tick_ts else age
+            if kill_age > kill_threshold and not self._kill_fired:
+                on_kill(
+                    f"TICK FEED STALE {kill_age:.0f}s > kill {kill_threshold:.0f}s "
+                    f"(session={session}, uptime={uptime:.0f}s) — escalating to process exit "
+                    f"for systemd restart (fd reclaim)."
+                )
+                self._kill_fired = True
