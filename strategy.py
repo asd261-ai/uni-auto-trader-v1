@@ -147,6 +147,10 @@ RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
 TICK_STALE_DAY_SEC      = int(os.getenv("TICK_STALE_DAY_SEC", "90"))     # liquid day session
 TICK_STALE_NIGHT_SEC    = int(os.getenv("TICK_STALE_NIGHT_SEC", "300"))  # thin night session
 TICK_CHECK_INTERVAL_SEC = int(os.getenv("TICK_CHECK_INTERVAL_SEC", "30"))
+TICK_STALE_KILL_DAY_SEC   = int(os.getenv("TICK_STALE_KILL_DAY_SEC", "180"))
+TICK_STALE_KILL_NIGHT_SEC = int(os.getenv("TICK_STALE_KILL_NIGHT_SEC", "600"))
+TICK_STALE_KILL_GRACE_SEC = int(os.getenv("TICK_STALE_KILL_GRACE_SEC", "180"))
+TICK_STALE_KILL          = os.getenv("TICK_STALE_KILL", "off").lower() == "on"  # Phase B arms os._exit
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
@@ -226,6 +230,7 @@ class MTXStrategy:
         # producer-side fix in fvg-trader/fvg/live.py (commit aef3946). Disable
         # with env FVG_BOOT_FLOOR=0.
         self._fvg_boot_ts_ms:        int  = int(time.time() * 1000)
+        self._proc_start_ts: float = time.time()  # wall-clock boot, for tick-wd kill grace
         self._fvg_boot_floor_enabled: bool = os.getenv("FVG_BOOT_FLOOR", "1") != "0"
 
         # Option C: 30m bias filter cache. _get_fvg_30m_bias() queries
@@ -274,6 +279,9 @@ class MTXStrategy:
         self._tick_wd = TickStaleWatchdog(
             day_threshold=TICK_STALE_DAY_SEC,
             night_threshold=TICK_STALE_NIGHT_SEC,
+            kill_day_threshold=TICK_STALE_KILL_DAY_SEC,
+            kill_night_threshold=TICK_STALE_KILL_NIGHT_SEC,
+            kill_grace=TICK_STALE_KILL_GRACE_SEC,
             check_interval=TICK_CHECK_INTERVAL_SEC,
         )
 
@@ -577,6 +585,8 @@ class MTXStrategy:
                     time.time(), self._current_session,
                     datetime.now(TZ_TW).weekday() >= 5,
                     lambda m: logger.warning(f"[tick-wd OBSERVE] {m}"),  # PHASE 2: -> self._safe_health_notify
+                    uptime=time.time() - self._proc_start_ts,
+                    on_kill=self._tick_wd_kill,
                 )
             except Exception as e:
                 logger.debug(f"tick watchdog error (silent): {e}")
@@ -1718,6 +1728,20 @@ class MTXStrategy:
             tg.send(self._tg_health_token, self._tg_health_chat, text)
         except Exception as e:
             logger.warning(f"Health notify failed: {e}")
+
+    def _tick_wd_kill(self, msg: str) -> None:
+        # Phase A (TICK_STALE_KILL off): observe only — log the would-fire, do NOT exit.
+        # Phase B (on): alert then os._exit(1) so systemd restarts and the OS reclaims fds.
+        if not TICK_STALE_KILL:
+            logger.error(f"[tick-wd KILL would-fire] {msg}")
+            return
+        logger.error(f"[tick-wd KILL] {msg}")
+        try:
+            self._safe_health_notify(f"🔪 Trader self-restart: {msg}")
+        except Exception:
+            pass
+        import os as _os
+        _os._exit(1)
 
     # ── HTTP ─────────────────────────────────────────────────────
 
