@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 _TZ = ZoneInfo("Asia/Taipei")
 _ORDERS_PATH = os.path.join(os.path.dirname(__file__), "orders.jsonl")
-_CACHE = {"ts": 0.0, "val": None}
+_CACHE = {"ts": 0.0, "val": None, "day": None}
 _CACHE_SEC = 30
 
 
@@ -101,13 +101,24 @@ def _compute(base: str):
 
 
 def heartbeat_fields(base: str = "MXF") -> dict:
-    """Cached real-fill P&L fields for the heartbeat payload. Never raises."""
+    """Cached real-fill P&L fields for the heartbeat payload. Never raises.
+
+    The cache also keys on the current 08:45 trading-day window: when the day
+    boundary moves the day-P&L window slides, so a stale pre-boundary value must
+    NOT be served. Otherwise the loss-lock check reads yesterday's full-day P&L
+    right after the 08:45 reset and phantom-re-locks the fresh day (regression
+    2026-06-02). See [[project-shared-account-margin-contention]].
+    """
     now = time.time()
-    if _CACHE["val"] is None or now - _CACHE["ts"] > _CACHE_SEC:
+    day = _trading_day_start_iso()
+    if (_CACHE["val"] is None
+            or now - _CACHE["ts"] > _CACHE_SEC
+            or _CACHE.get("day") != day):
         try:
             _CACHE["val"] = _compute(base)
         except Exception:
             _CACHE["val"] = {"real_trading_day_pnl_pts": None,
                              "real_month_pnl_pts": None, "real_open": "err"}
         _CACHE["ts"] = now
+        _CACHE["day"] = day
     return _CACHE["val"]
