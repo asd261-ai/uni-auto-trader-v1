@@ -15,7 +15,8 @@ def compute_pnl_pts_real(dir_: str, entry_fill, exit_fill) -> Optional[int]:
 
 def finalize_exit(record: Dict[str, Any], exit_fill) -> Dict[str, Any]:
     """Stamp exit_fill + pnl_pts_real onto a deferred trade record, in place.
-    exit_fill=None is the timeout-flush case → pnl_pts_real stays None."""
+    exit_fill=None is the timeout-flush case → pnl_pts_real stays None.
+    Intended to be called once per record; a second call overwrites the stamped values."""
     record["exit_fill"] = exit_fill
     record["pnl_pts_real"] = compute_pnl_pts_real(
         record.get("dir"), record.get("entry_fill"), exit_fill)
@@ -30,7 +31,7 @@ def due_records(pending: List[Dict[str, Any]], now_ms: int) -> List[Dict[str, An
 
 def serialize_pending(pending: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Plain JSON-able snapshot of pending-exit records for the state file."""
-    return [{"record": p["record"], "deadline_ms": p.get("deadline_ms", 0)}
+    return [{"record": dict(p["record"]), "deadline_ms": p.get("deadline_ms", 0)}
             for p in pending if p.get("record") is not None]
 
 

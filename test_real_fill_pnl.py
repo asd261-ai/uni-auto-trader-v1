@@ -23,8 +23,15 @@ class ComputePnlPtsReal(unittest.TestCase):
     def test_both_missing_is_none(self):
         self.assertIsNone(rfp.compute_pnl_pts_real("long", None, None))
 
+    def test_long_loss_is_negative(self):
+        self.assertEqual(rfp.compute_pnl_pts_real("long", 46200, 46100), -100)
+
+    def test_short_loss_is_negative(self):
+        self.assertEqual(rfp.compute_pnl_pts_real("short", 46100, 46200), -100)
+
     def test_result_is_rounded_int(self):
         self.assertEqual(rfp.compute_pnl_pts_real("long", 46100.4, 46160.4), 60)
+        self.assertIsInstance(rfp.compute_pnl_pts_real("long", 46100.4, 46160.4), int)
 
 
 class FinalizeExit(unittest.TestCase):
@@ -104,3 +111,10 @@ class SerializePending(unittest.TestCase):
 
     def test_deserialize_drops_entries_without_record(self):
         self.assertEqual(rfp.deserialize_pending([{"deadline_ms": 1}]), [])
+
+    def test_serialize_does_not_share_record_reference(self):
+        # mutating the serialized blob must NOT corrupt the live pending list
+        pending = [{"record": {"id": 1, "exit_fill": None}, "deadline_ms": 10}]
+        blob = rfp.serialize_pending(pending)
+        blob[0]["record"]["exit_fill"] = 99999
+        self.assertIsNone(pending[0]["record"]["exit_fill"])
