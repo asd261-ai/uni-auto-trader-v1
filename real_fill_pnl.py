@@ -20,3 +20,9 @@ def finalize_exit(record: Dict[str, Any], exit_fill) -> Dict[str, Any]:
     record["pnl_pts_real"] = compute_pnl_pts_real(
         record.get("dir"), record.get("entry_fill"), exit_fill)
     return record
+
+
+def due_records(pending: List[Dict[str, Any]], now_ms: int) -> List[Dict[str, Any]]:
+    """Pending-exit entries whose flush deadline has passed (timeout candidates).
+    A missing deadline_ms is treated as due (0) so malformed entries never linger."""
+    return [p for p in pending if p.get("deadline_ms", 0) <= now_ms]

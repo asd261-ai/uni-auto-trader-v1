@@ -60,3 +60,27 @@ class FinalizeExit(unittest.TestCase):
     def test_mutates_in_place_and_returns_same_object(self):
         rec = self._record()
         self.assertIs(rfp.finalize_exit(rec, 46160), rec)
+
+
+class DueRecords(unittest.TestCase):
+    def _pe(self, deadline_ms):
+        # a "pending exit" awaiting fill: carries record + flush deadline
+        return {"record": {"id": deadline_ms}, "deadline_ms": deadline_ms}
+
+    def test_returns_only_past_deadline(self):
+        pending = [self._pe(100), self._pe(200), self._pe(300)]
+        due = rfp.due_records(pending, now_ms=200)
+        self.assertEqual([p["deadline_ms"] for p in due], [100, 200])
+
+    def test_inclusive_boundary(self):
+        pending = [self._pe(200)]
+        self.assertEqual(len(rfp.due_records(pending, now_ms=200)), 1)
+
+    def test_none_due_returns_empty(self):
+        pending = [self._pe(500)]
+        self.assertEqual(rfp.due_records(pending, now_ms=200), [])
+
+    def test_missing_deadline_treated_as_due(self):
+        # defensive: a malformed entry (no deadline) should flush, not linger forever
+        pending = [{"record": {"id": 1}}]
+        self.assertEqual(len(rfp.due_records(pending, now_ms=0)), 1)
