@@ -528,7 +528,15 @@ class MTXStrategy:
                 return  # front doesn't match → likely a manual/foreign fill; leave queue intact
             pend = self._pending_fills.pop(0)
             if pend["kind"] != "entry":
-                return  # exit fill — nothing to anchor
+                # Task B: exit fill — stamp the real exit price onto the deferred record
+                # and write trades.jsonl now. (Layer ① still owns realised P&L.)
+                pe = pend.get("pe")
+                if pe is not None and pe in self._pending_exit_records:
+                    self._pending_exit_records.remove(pe)
+                    rec = real_fill_pnl.finalize_exit(pe["record"], price)
+                    self._record_trade(**rec)
+                    self._save_pending_exit_records()
+                return
             unit = pend["unit"]
             if unit.get("entry_fill") is not None:
                 return
