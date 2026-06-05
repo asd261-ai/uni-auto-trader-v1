@@ -22,6 +22,7 @@ import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
 import order_reject
+import real_fill_pnl  # task B: real-fill P&L fields for trades.jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -679,7 +680,8 @@ class MTXStrategy:
         return (now - timedelta(days=1)).date() if now.time() < dtime(8, 45) else now.date()
 
     def _record_trade(self, *, source: str, label: str, dir_: str, entry, exit_price,
-                       stop, target, pnl_pts: float, reason: str, sig_id, opened_at_ms):
+                       stop, target, pnl_pts: float, reason: str, sig_id, opened_at_ms,
+                       entry_fill=None, exit_fill=None, pnl_pts_real=None):
         """Append one trade record to trades.jsonl AND update monthly counters.
 
         Called from _close_unit for every closed unit regardless of source.
@@ -705,6 +707,9 @@ class MTXStrategy:
                 "target":       target,
                 "pnl_pts":      pnl_pts,
                 "pnl_ntd":      int(pnl_pts * POINT_VALUE) if pnl_pts else 0,
+                "entry_fill":   entry_fill,
+                "exit_fill":    exit_fill,
+                "pnl_pts_real": pnl_pts_real,
                 "reason":       reason,
                 "duration_sec": duration_sec,
             }
