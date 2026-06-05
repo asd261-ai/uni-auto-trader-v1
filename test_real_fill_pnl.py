@@ -35,38 +35,44 @@ class ComputePnlPtsReal(unittest.TestCase):
 
 
 class FinalizeExit(unittest.TestCase):
-    def _record(self, dir_="long", entry_fill=46100):
-        # mirrors the trades.jsonl record dict shape (key "dir", "entry_fill")
-        return {"dir": dir_, "entry_fill": entry_fill,
-                "exit_fill": None, "pnl_pts_real": None}
+    def _record(self, entry_fill=46100):
+        # mirrors strategy's record_kwargs shape; direction is passed EXPLICITLY to
+        # finalize_exit (never read from the dict) — see strategy._close_unit.
+        return {"entry_fill": entry_fill, "exit_fill": None, "pnl_pts_real": None}
 
     def test_sets_exit_fill_and_pnl_when_both_present(self):
-        rec = self._record(dir_="long", entry_fill=46100)
-        out = rfp.finalize_exit(rec, 46160)
+        rec = self._record(entry_fill=46100)
+        out = rfp.finalize_exit(rec, 46160, "long")
         self.assertEqual(out["exit_fill"], 46160)
         self.assertEqual(out["pnl_pts_real"], 60)
 
     def test_short_direction(self):
-        rec = self._record(dir_="short", entry_fill=46470)
-        rfp.finalize_exit(rec, 46450)
+        rec = self._record(entry_fill=46470)
+        rfp.finalize_exit(rec, 46450, "short")
         self.assertEqual(rec["pnl_pts_real"], 20)
 
     def test_missing_entry_fill_leaves_pnl_none(self):
-        rec = self._record(dir_="long", entry_fill=None)
-        rfp.finalize_exit(rec, 46160)
+        rec = self._record(entry_fill=None)
+        rfp.finalize_exit(rec, 46160, "long")
         self.assertEqual(rec["exit_fill"], 46160)
         self.assertIsNone(rec["pnl_pts_real"])
 
     def test_timeout_flush_exit_fill_none(self):
-        # poll-loop timeout path: no real fill arrived → exit_fill=None, pnl None
-        rec = self._record(dir_="long", entry_fill=46100)
-        rfp.finalize_exit(rec, None)
+        rec = self._record(entry_fill=46100)
+        rfp.finalize_exit(rec, None, "long")
         self.assertIsNone(rec["exit_fill"])
         self.assertIsNone(rec["pnl_pts_real"])
 
     def test_mutates_in_place_and_returns_same_object(self):
         rec = self._record()
-        self.assertIs(rfp.finalize_exit(rec, 46160), rec)
+        self.assertIs(rfp.finalize_exit(rec, 46160, "long"), rec)
+
+    def test_long_winner_with_record_kwargs_dir_key(self):
+        # REGRESSION: strategy's record_kwargs uses key 'dir_' (not 'dir').
+        # finalize_exit must NOT read direction from the dict — a long winner stays +60.
+        rec = {"dir_": "long", "entry_fill": 46100, "exit_fill": None, "pnl_pts_real": None}
+        rfp.finalize_exit(rec, 46160, rec["dir_"])
+        self.assertEqual(rec["pnl_pts_real"], 60)
 
 
 class DueRecords(unittest.TestCase):

@@ -13,13 +13,14 @@ def compute_pnl_pts_real(dir_: str, entry_fill, exit_fill) -> Optional[int]:
     return round(diff)
 
 
-def finalize_exit(record: Dict[str, Any], exit_fill) -> Dict[str, Any]:
+def finalize_exit(record: Dict[str, Any], exit_fill, dir_: str) -> Dict[str, Any]:
     """Stamp exit_fill + pnl_pts_real onto a deferred trade record, in place.
-    exit_fill=None is the timeout-flush case → pnl_pts_real stays None.
-    Intended to be called once per record; a second call overwrites the stamped values."""
+    Direction is passed EXPLICITLY (callers use varying record key names, e.g.
+    strategy's record_kwargs uses 'dir_') so the P&L sign never silently depends on a
+    dict-key match. exit_fill=None (timeout flush) → pnl_pts_real stays None. Intended
+    to be called once per record (a second call overwrites the stamped values)."""
     record["exit_fill"] = exit_fill
-    record["pnl_pts_real"] = compute_pnl_pts_real(
-        record.get("dir"), record.get("entry_fill"), exit_fill)
+    record["pnl_pts_real"] = compute_pnl_pts_real(dir_, record.get("entry_fill"), exit_fill)
     return record
 
 

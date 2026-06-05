@@ -536,7 +536,7 @@ class MTXStrategy:
                 pe = pend.get("pe")
                 if pe is not None and pe in self._pending_exit_records:
                     self._pending_exit_records.remove(pe)
-                    rec = real_fill_pnl.finalize_exit(pe["record"], price)
+                    rec = real_fill_pnl.finalize_exit(pe["record"], price, pe["record"]["dir_"])
                     self._record_trade(**rec)
                     self._save_pending_exit_records()
                 return
@@ -563,7 +563,7 @@ class MTXStrategy:
                 return
             for pe in due:
                 self._pending_exit_records.remove(pe)
-                rec = real_fill_pnl.finalize_exit(pe["record"], None)
+                rec = real_fill_pnl.finalize_exit(pe["record"], None, pe["record"]["dir_"])
                 self._record_trade(**rec)
                 logger.warning(
                     f"[real-fill] exit fill timeout (>{EXIT_FILL_TIMEOUT_MS // 1000}s) "
@@ -929,7 +929,7 @@ class MTXStrategy:
             logger.warning(f"pending-exit load failed (continuing fresh): {e}")
             restored = []
         for pe in restored:
-            rec = real_fill_pnl.finalize_exit(pe["record"], None)
+            rec = real_fill_pnl.finalize_exit(pe["record"], None, pe["record"]["dir_"])
             self._record_trade(**rec)
             logger.warning(f"[real-fill] restart flush deferred record "
                            f"src={rec.get('source')} id={rec.get('id')} → exit_fill=null")
