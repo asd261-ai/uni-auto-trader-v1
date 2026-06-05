@@ -549,6 +549,25 @@ class MTXStrategy:
             if self._fill_anchor and pend["source"] == "mtx":
                 fill_emit.send({"source": "mtx", "id": pend["id"], "fill_price": price})
 
+    def _flush_due_exit_records(self):
+        """Task B safety net: flush deferred trade records whose real exit fill never
+        arrived within EXIT_FILL_TIMEOUT_MS → write with exit_fill=null + warn. Worst
+        case is the same information as before this feature (no row is ever lost)."""
+        with self._lock:
+            now_ms = int(time.time() * 1000)
+            due = real_fill_pnl.due_records(self._pending_exit_records, now_ms)
+            if not due:
+                return
+            for pe in due:
+                self._pending_exit_records.remove(pe)
+                rec = real_fill_pnl.finalize_exit(pe["record"], None)
+                self._record_trade(**rec)
+                logger.warning(
+                    f"[real-fill] exit fill timeout (>{EXIT_FILL_TIMEOUT_MS // 1000}s) "
+                    f"src={rec.get('source')} id={rec.get('id')} reason={rec.get('reason')} "
+                    f"→ wrote exit_fill=null")
+            self._save_pending_exit_records()
+
     def on_order_rejected(self, productid: str, bs: str, orderstatus: str):
         """Called from trader._on_reply (broker thread) when a reply is a rejection.
         Roll back the optimistic unit so no phantom unit / phantom P&L lingers."""
@@ -575,6 +594,7 @@ class MTXStrategy:
                 self._check_session_change()
                 self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
                 self._check_daily_loss_lock()     # Phase 7: daily MAX LOSS lock from REAL P&L (restart-safe)
+                self._flush_due_exit_records()    # task B: flush deferred records past 60s timeout
                 if not is_weekend:
                     for src_info in SIGNAL_SOURCES:
                         source = src_info["source"]
