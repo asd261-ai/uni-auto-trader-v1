@@ -141,6 +141,8 @@ MONTHLY_SUMMARY_PATH = Path(__file__).parent / "monthly_summary.jsonl"
 # never trusted blindly (that caused phantom MTX units — see mtx_restore.py).
 FVG_STATE_PATH       = Path(__file__).parent / "fvg_state.json"
 MTX_STATE_PATH       = Path(__file__).parent / "mtx_state.json"
+PENDING_EXIT_PATH    = Path(__file__).parent / "pending_exit_records.json"  # task B: deferred trade records awaiting real exit fill
+EXIT_FILL_TIMEOUT_MS = 60_000   # task B: flush deferred record (exit_fill=null) if no real fill in 60s
 
 # Plan D: broker reconciliation
 RECON_CHECK_INTERVAL_SEC = 60   # how often to query broker (be polite to API)
@@ -302,6 +304,7 @@ class MTXStrategy:
         # (when FILL_ANCHOR) POST it to the Worker. FILL_ANCHOR default OFF — capture
         # + log only; flip on after verifying capture is correct.
         self._pending_fills: List[dict] = []
+        self._pending_exit_records: List[dict] = []   # task B: prepared trade records awaiting real exit fill
         self._fill_anchor: bool         = os.getenv("FILL_ANCHOR", "0") == "1"
 
         if dry_run:
@@ -1642,7 +1645,8 @@ class MTXStrategy:
             # aligned with send order (so an exit fill isn't mis-read as an entry fill
             # on same-direction reversals). Exit fills are consumed but not acted on
             # (Layer ① already derives real exit P&L from orders.jsonl).
-            self._pending_fills.append({"kind": "exit", "bs": "S" if unit["dir"] == "long" else "B"})
+            exit_pending = {"kind": "exit", "bs": "S" if unit["dir"] == "long" else "B"}
+            self._pending_fills.append(exit_pending)
             self._pending_fills = self._pending_fills[-12:]
 
         pnl_pts = 0
@@ -1663,13 +1667,24 @@ class MTXStrategy:
             "pnl_pts":   pnl_pts,
             "reason":    reason,
         })
-        # Persistent trade log + monthly counters (跨 restart 持久化)
-        self._record_trade(
+        # Persistent trade log + monthly counters (跨 restart 持久化).
+        # Task B: real orders defer the write until on_fill stamps the real exit_fill;
+        # paper (no broker order) has no fill coming → write immediately with nulls.
+        record_kwargs = dict(
             source=source, label=unit["sig_label"], dir_=unit["dir"],
             entry=unit["entry"], exit_price=exit_price, stop=unit["stop"],
             target=unit["target"], pnl_pts=pnl_pts, reason=reason,
             sig_id=unit["id"], opened_at_ms=unit.get("opened_at"),
+            entry_fill=unit.get("entry_fill"),
         )
+        if place_order:
+            pe = {"record": record_kwargs,
+                  "deadline_ms": int(time.time() * 1000) + EXIT_FILL_TIMEOUT_MS}
+            exit_pending["pe"] = pe
+            self._pending_exit_records.append(pe)
+            self._save_pending_exit_records()
+        else:
+            self._record_trade(**record_kwargs)
         # Phase 7: accumulate signal-side trading-day P&L — DISPLAY ONLY (heartbeat
         # field trading_day_pnl_pts). Lock authority moved to _check_daily_loss_lock,
         # which reads the restart-safe REAL-account P&L from pnl_calc. (Old behaviour
