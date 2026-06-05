@@ -407,6 +407,9 @@ class MTXStrategy:
         self._restore_month_from_log()
         # Restore FVG units from disk (so trader restart doesn't lose track of an open FVG trade)
         self._load_fvg_state()
+        # Task B: flush any deferred trade records orphaned by a crash before their exit fill.
+        # Must run AFTER _restore_month_from_log so flushed rows increment counters once.
+        self._flush_pending_exit_records_on_boot()
 
         self._running = True
         t = threading.Thread(target=self._poll_loop, daemon=True)
@@ -900,6 +903,39 @@ class MTXStrategy:
             save_mtx_state(str(MTX_STATE_PATH), self._units.get("mtx", []))
         except Exception as e:
             logger.error(f"MTX state save failed: {e}")
+
+    def _save_pending_exit_records(self) -> None:
+        """Task B: atomic write of deferred-exit records to a dedicated file. Small,
+        rewritten on every defer/fill/timeout so a crash between close and fill never
+        loses a trades.jsonl row."""
+        try:
+            data = {"pending": real_fill_pnl.serialize_pending(self._pending_exit_records)}
+            tmp = PENDING_EXIT_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            tmp.replace(PENDING_EXIT_PATH)
+        except Exception as e:
+            logger.error(f"pending-exit save failed: {e}")
+
+    def _flush_pending_exit_records_on_boot(self) -> None:
+        """Task B: at startup, any deferred record whose exit fill never arrived (crash
+        between close and fill) is flushed with exit_fill=null — the row is never lost.
+        The broker fill can no longer be re-matched after restart, so we do not wait."""
+        if not PENDING_EXIT_PATH.exists():
+            return
+        try:
+            data = json.loads(PENDING_EXIT_PATH.read_text())
+            restored = real_fill_pnl.deserialize_pending(data.get("pending"))
+        except Exception as e:
+            logger.warning(f"pending-exit load failed (continuing fresh): {e}")
+            restored = []
+        for pe in restored:
+            rec = real_fill_pnl.finalize_exit(pe["record"], None)
+            self._record_trade(**rec)
+            logger.warning(f"[real-fill] restart flush deferred record "
+                           f"src={rec.get('source')} id={rec.get('id')} → exit_fill=null")
+        # Clear the file so the same rows cannot be flushed twice on the next restart.
+        self._pending_exit_records = []
+        self._save_pending_exit_records()
 
     def _record_missed_exit(self, unit: dict, worker: dict) -> None:
         """A locally-held MTX unit the Worker shows already closed (exited while the bot
