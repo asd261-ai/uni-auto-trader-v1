@@ -1709,9 +1709,10 @@ class MTXStrategy:
             # aligned with send order (so an exit fill isn't mis-read as an entry fill
             # on same-direction reversals). Exit fills are consumed but not acted on
             # (Layer ① already derives real exit P&L from orders.jsonl).
+            # Created here (send order). Appended to _pending_fills only after its
+            # deferred record `pe` is attached below, so it never sits in the queue
+            # with pe missing (closes a race window if a caller ever skips the lock).
             exit_pending = {"kind": "exit", "bs": "S" if unit["dir"] == "long" else "B"}
-            self._pending_fills.append(exit_pending)
-            self._pending_fills = self._pending_fills[-12:]
 
         pnl_pts = 0
         if exit_price and unit["entry"]:
@@ -1745,6 +1746,8 @@ class MTXStrategy:
             pe = {"record": record_kwargs,
                   "deadline_ms": int(time.time() * 1000) + EXIT_FILL_TIMEOUT_MS}
             exit_pending["pe"] = pe
+            self._pending_fills.append(exit_pending)   # enters queue already carrying pe
+            self._pending_fills = self._pending_fills[-12:]
             self._pending_exit_records.append(pe)
             self._save_pending_exit_records()
         else:
