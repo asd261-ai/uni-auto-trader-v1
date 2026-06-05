@@ -26,3 +26,18 @@ def due_records(pending: List[Dict[str, Any]], now_ms: int) -> List[Dict[str, An
     """Pending-exit entries whose flush deadline has passed (timeout candidates).
     A missing deadline_ms is treated as due (0) so malformed entries never linger."""
     return [p for p in pending if p.get("deadline_ms", 0) <= now_ms]
+
+
+def serialize_pending(pending: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Plain JSON-able snapshot of pending-exit records for the state file."""
+    return [{"record": p["record"], "deadline_ms": p.get("deadline_ms", 0)}
+            for p in pending if p.get("record") is not None]
+
+
+def deserialize_pending(blob) -> List[Dict[str, Any]]:
+    """Rebuild pending-exit list from state-file blob (None → empty).
+    Entries without a record are dropped (corruption-safe)."""
+    if not blob:
+        return []
+    return [{"record": e["record"], "deadline_ms": e.get("deadline_ms", 0)}
+            for e in blob if isinstance(e, dict) and e.get("record") is not None]

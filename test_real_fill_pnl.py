@@ -84,3 +84,23 @@ class DueRecords(unittest.TestCase):
         # defensive: a malformed entry (no deadline) should flush, not linger forever
         pending = [{"record": {"id": 1}}]
         self.assertEqual(len(rfp.due_records(pending, now_ms=0)), 1)
+
+
+class SerializePending(unittest.TestCase):
+    def test_round_trip_preserves_records(self):
+        pending = [
+            {"record": {"id": 1, "dir": "long", "entry_fill": 46100,
+                        "exit_fill": None, "pnl_pts_real": None}, "deadline_ms": 123},
+            {"record": {"id": 2, "dir": "short", "entry_fill": None,
+                        "exit_fill": None, "pnl_pts_real": None}, "deadline_ms": 456},
+        ]
+        blob = rfp.serialize_pending(pending)
+        import json
+        restored = rfp.deserialize_pending(json.loads(json.dumps(blob)))
+        self.assertEqual(restored, pending)
+
+    def test_deserialize_none_is_empty_list(self):
+        self.assertEqual(rfp.deserialize_pending(None), [])
+
+    def test_deserialize_drops_entries_without_record(self):
+        self.assertEqual(rfp.deserialize_pending([{"deadline_ms": 1}]), [])
