@@ -11,3 +11,12 @@ def compute_pnl_pts_real(dir_: str, entry_fill, exit_fill) -> Optional[int]:
         return None
     diff = (exit_fill - entry_fill) if dir_ == "long" else (entry_fill - exit_fill)
     return round(diff)
+
+
+def finalize_exit(record: Dict[str, Any], exit_fill) -> Dict[str, Any]:
+    """Stamp exit_fill + pnl_pts_real onto a deferred trade record, in place.
+    exit_fill=None is the timeout-flush case → pnl_pts_real stays None."""
+    record["exit_fill"] = exit_fill
+    record["pnl_pts_real"] = compute_pnl_pts_real(
+        record.get("dir"), record.get("entry_fill"), exit_fill)
+    return record
