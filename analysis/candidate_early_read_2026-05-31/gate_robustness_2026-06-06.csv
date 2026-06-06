@@ -1,0 +1,5 @@
+window,gate,n,wins,win_rate,sum_pts,mean,ci95up_min,ci95up_max,frac_seeds_ci_up_lt0,lodo_days,lodo_flips,thin
+full_5_22_6_5,short_x_night,38,17,44.7,-574.0,-15.1,-0.76,0.87,0.42,11,0,False
+full_5_22_6_5,③_x_all,22,8,36.4,-418.0,-19.0,3.55,7.41,0.0,8,0,False
+oos_6_1_6_5,short_x_night,14,6,42.9,-81.0,-5.8,19.29,22.86,0.0,5,1,True
+oos_6_1_6_5,③_x_all,5,1,20.0,-114.0,-22.8,25.6,29.8,0.0,3,1,True
