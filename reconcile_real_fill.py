@@ -46,34 +46,38 @@ def day_window(trading_day: str) -> Tuple[str, str]:
     return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
 
 
-def reconcile(trades: List[Dict[str, Any]], fifo_realized_pts: float,
-              fifo_roundtrips: int, fifo_source: str = "mtx") -> Dict[str, Any]:
-    """Pure reconciliation math. Compares the rows whose broker fills land in orders.jsonl
-    against the orders.jsonl FIFO ground truth (realized-points sum + round-trip count).
+# Sources whose signals place REAL orders through the trader → they land in orders.jsonl and are
+# reconciled against the FIFO ground truth. BOTH mtx and fvg are real money on MXF (corrected
+# 2026-06-08 — Sean: "FVG is not just paper, it talks to the trader too". The VPS trades.jsonl is
+# the live trader ledger; every row here is a real broker round-trip, none are paper.)
+_REAL_SOURCES = ("mtx", "fvg")
 
-    ONLY `fifo_source` rows (default "mtx", the real-money signals on the MXF contract) are
-    reconciled against the FIFO. FVG runs paper and NEVER hits orders.jsonl (strategy.py:1189),
-    so FVG rows are surfaced separately (other_n / other_null) and never flip the verdict — a
-    paper row legitimately has no broker fill, so its null pnl_pts_real is expected, not a bug.
+
+def reconcile(trades: List[Dict[str, Any]], fifo_realized_pts: float,
+              fifo_roundtrips: int) -> Dict[str, Any]:
+    """Pure reconciliation math. Every source in the trader's trades.jsonl places REAL orders
+    (mtx AND fvg → orders.jsonl), so all real-source rows are reconciled against the orders.jsonl
+    FIFO ground truth (realized-points sum + round-trip count). A null pnl_pts_real on any real
+    row is a RED — the deferred exit_fill never landed.
 
     Returns a report dict — never raises on empty input.
       n_trades       all rows in trades.jsonl for the day (every source)
-      n_real         fifo_source rows with a non-null pnl_pts_real (real exit_fill came back)
-      n_null         fifo_source rows with pnl_pts_real == None (fill missing → RED flag)
-      sum_signal     Σ pnl_pts over fifo_source rows  (signal-based, the under-reporting number)
-      sum_real       Σ pnl_pts_real over fifo_source rows  (real-fill, non-null only)
+      n_real         real-source rows with a non-null pnl_pts_real (real exit_fill came back)
+      n_null         real-source rows with pnl_pts_real == None (fill missing → RED flag)
+      sum_signal     Σ pnl_pts over real-source rows  (signal-based, the under-reporting number)
+      sum_real       Σ pnl_pts_real over real-source rows  (real-fill, non-null only)
       fifo_realized  orders.jsonl FIFO realized P&L (ground truth)
       real_vs_fifo   sum_real − fifo_realized   (≈0 ⇒ field is trustworthy)
       signal_vs_real sum_signal − sum_real      (quantifies the systematic under-report)
       count_mismatch n_real != fifo_roundtrips  (manual same-contract trades or missed fills)
-      other_n        rows from non-fifo_source (e.g. FVG paper) — informational only
-      other_null     of those, how many have null pnl_pts_real (expected for paper)
+      other_n        rows from a non-real source (none today; reserved for a future paper source)
+      other_null     of those, how many have null pnl_pts_real
       by_source      per-source {n, sum_signal, sum_real, n_null}  (all sources)
-      verdict        "OK" | "WARN" | "RED"  (RED only on a fifo_source null fill)
+      verdict        "OK" | "WARN" | "RED"  (RED on any real-source null fill)
     """
     n_trades = len(trades)
-    compared = [t for t in trades if t.get("source") == fifo_source]
-    other = [t for t in trades if t.get("source") != fifo_source]
+    compared = [t for t in trades if t.get("source") in _REAL_SOURCES]
+    other = [t for t in trades if t.get("source") not in _REAL_SOURCES]
     real_rows = [t for t in compared if t.get("pnl_pts_real") is not None]
     null_rows = [t for t in compared if t.get("pnl_pts_real") is None]
     sum_signal = round(sum(_num(t.get("pnl_pts")) for t in compared), 1)
@@ -117,7 +121,6 @@ def reconcile(trades: List[Dict[str, Any]], fifo_realized_pts: float,
         "real_vs_fifo": real_vs_fifo,
         "signal_vs_real": round(sum_signal - sum_real, 1),
         "count_mismatch": count_mismatch,
-        "fifo_source": fifo_source,
         "other_n": len(other),
         "other_null": sum(1 for t in other if t.get("pnl_pts_real") is None),
         "by_source": by_source,
@@ -174,17 +177,16 @@ def format_report(trading_day: str, base: str, rep: Dict[str, Any]) -> str:
         "",
         f"**Verdict: {icon} {rep['verdict']}**",
         "",
-        f"_FIFO-reconciled source: **{rep['fifo_source']}** (real-money on MXF). "
-        f"Other sources (FVG paper, not in orders.jsonl): {rep['other_n']} rows "
-        f"({rep['other_null']} null — expected for paper)._",
+        f"_Real-money sources reconciled vs orders.jsonl FIFO: **mtx + fvg** (both place real "
+        f"orders on MXF). Non-real sources (none expected): {rep['other_n']} rows._",
         "",
         "| metric | value |",
         "|---|---|",
         f"| trades.jsonl rows (all sources) | {rep['n_trades']} |",
-        f"| {rep['fifo_source']} rows with pnl_pts_real | {rep['n_real']} |",
-        f"| **{rep['fifo_source']} null pnl_pts_real (missing fill)** | **{rep['n_null']}** |",
-        f"| Σ pnl_pts ({rep['fifo_source']} signal) | {rep['sum_signal']} |",
-        f"| Σ pnl_pts_real ({rep['fifo_source']}) | {rep['sum_real']} |",
+        f"| real rows with pnl_pts_real | {rep['n_real']} |",
+        f"| **null pnl_pts_real (missing fill)** | **{rep['n_null']}** |",
+        f"| Σ pnl_pts (signal) | {rep['sum_signal']} |",
+        f"| Σ pnl_pts_real (real) | {rep['sum_real']} |",
         f"| orders.jsonl FIFO realized | {rep['fifo_realized']} ({rep['fifo_roundtrips']} round-trips) |",
         f"| **real − FIFO** (≈0 ⇒ trustworthy) | **{rep['real_vs_fifo']}** |",
         f"| signal − real (under-report) | {rep['signal_vs_real']} |",
@@ -204,12 +206,11 @@ def format_report(trading_day: str, base: str, rep: Dict[str, Any]) -> str:
     lines += [
         "",
         "## Read",
-        "- **OK** ⇒ mtx pnl_pts_real matches orders.jsonl FIFO; the field is trustworthy → safe to merge feat→main.",
-        "- **null fills** (mtx) ⇒ on_fill didn't stamp exit_fill within 60s timeout; check the deferred-write path.",
-        "- **count mismatch** with 0 nulls usually ⇒ a manual same-contract trade hit orders.jsonl "
-        "(shared account 0239174) — FIFO includes it but trades.jsonl doesn't. Expected if Sean hand-traded.",
-        "- FVG rows are paper (never in orders.jsonl) so they're excluded from the FIFO check; their "
-        "null pnl_pts_real is expected, not a failure.",
+        "- **OK** ⇒ Σ pnl_pts_real (mtx+fvg) matches orders.jsonl FIFO; the field is trustworthy → safe to merge feat→main.",
+        "- **null fills** ⇒ on_fill didn't stamp exit_fill within 60s timeout; check the deferred-write path.",
+        "- **count mismatch** with 0 nulls ⇒ a manual same-contract trade hit orders.jsonl "
+        "(shared account 0239174) — FIFO includes it but trades.jsonl doesn't. Expected ONLY if Sean hand-traded.",
+        "- Both mtx AND fvg are real money on MXF (fvg talks to the trader too) → both land in orders.jsonl and are counted.",
         "- Authoritative number is always orders.jsonl FIFO, never signal pnl_pts.",
     ]
     return "\n".join(lines)

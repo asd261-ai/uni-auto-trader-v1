@@ -73,30 +73,41 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(rep["verdict"], "OK")  # real matches FIFO; the gap is signal's fault
 
     def test_by_source_breakdown(self):
+        # Both mtx and fvg are real; by_source breaks down each and sum_real includes both.
         trades = [_trade(source="mtx", pnl_pts=10, pnl_pts_real=8),
-                  _trade(source="fvg", pnl_pts=-3, pnl_pts_real=None)]
-        rep = reconcile(trades, fifo_realized_pts=8.0, fifo_roundtrips=1)
+                  _trade(source="fvg", pnl_pts=-3, pnl_pts_real=-4)]
+        rep = reconcile(trades, fifo_realized_pts=4.0, fifo_roundtrips=2)
         self.assertEqual(rep["by_source"]["mtx"]["n"], 1)
-        self.assertEqual(rep["by_source"]["fvg"]["n_null"], 1)
-        self.assertEqual(rep["by_source"]["fvg"]["sum_real"], 0.0)
+        self.assertEqual(rep["by_source"]["fvg"]["n"], 1)
+        self.assertEqual(rep["by_source"]["fvg"]["sum_real"], -4.0)
+        self.assertEqual(rep["sum_real"], 4.0)    # mtx 8 + fvg -4, both real, both counted
 
-    def test_fvg_paper_null_does_not_flip_verdict(self):
-        # FVG runs paper (never in orders.jsonl) → its null pnl_pts_real is EXPECTED, must
-        # NOT make the day RED. Only the mtx row is reconciled against the FIFO.
+    def test_fvg_is_real_money_counted_in_fifo(self):
+        # CORRECTED 2026-06-08 (Sean: "FVG is not just paper, it talks to the trader too"):
+        # fvg places real orders → counted toward the FIFO comparison alongside mtx. The live
+        # 6/8 case — mtx + fvg pnl_pts_real summed exactly to the orders.jsonl FIFO.
+        trades = [_trade(source="mtx", pnl_pts=-138, pnl_pts_real=-137),
+                  _trade(source="fvg", pnl_pts=318, pnl_pts_real=342),
+                  _trade(source="fvg", pnl_pts=-44.5, pnl_pts_real=-17)]
+        rep = reconcile(trades, fifo_realized_pts=188.0, fifo_roundtrips=3)
+        self.assertEqual(rep["sum_real"], 188.0)   # -137 + 342 + -17, includes fvg
+        self.assertEqual(rep["real_vs_fifo"], 0.0)
+        self.assertEqual(rep["verdict"], "OK")
+        self.assertEqual(rep["other_n"], 0)        # no paper source — fvg is real
+
+    def test_fvg_null_is_red(self):
+        # fvg is real → a missing fvg fill (null pnl_pts_real) is a RED, same as mtx.
         trades = [_trade(source="mtx", pnl_pts=10, pnl_pts_real=8),
                   _trade(source="fvg", pnl_pts=-3, pnl_pts_real=None)]
         rep = reconcile(trades, fifo_realized_pts=8.0, fifo_roundtrips=1)
-        self.assertEqual(rep["verdict"], "OK")
-        self.assertEqual(rep["n_null"], 0)        # mtx-scoped: the fvg null doesn't count
-        self.assertEqual(rep["other_n"], 1)
-        self.assertEqual(rep["other_null"], 1)
-        self.assertEqual(rep["sum_real"], 8.0)    # fvg row excluded from the FIFO comparison
+        self.assertEqual(rep["verdict"], "RED")
+        self.assertEqual(rep["n_null"], 1)         # the fvg null counts now
 
-    def test_mtx_null_still_red_with_fvg_present(self):
-        # A real mtx missing-fill must still go RED even when FVG paper rows are present.
+    def test_mtx_null_is_red_with_fvg_real_present(self):
+        # A missing mtx fill is RED even alongside real fvg rows; n_null counts only the missing one.
         trades = [_trade(source="mtx", pnl_pts=10, pnl_pts_real=None),
-                  _trade(source="fvg", pnl_pts=-3, pnl_pts_real=None)]
-        rep = reconcile(trades, fifo_realized_pts=0.0, fifo_roundtrips=0)
+                  _trade(source="fvg", pnl_pts=-3, pnl_pts_real=-4)]
+        rep = reconcile(trades, fifo_realized_pts=-4.0, fifo_roundtrips=1)
         self.assertEqual(rep["verdict"], "RED")
         self.assertEqual(rep["n_null"], 1)
 
