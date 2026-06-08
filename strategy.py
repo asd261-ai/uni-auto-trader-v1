@@ -19,6 +19,7 @@ from exit_reason import stop_hit_reason
 from atr_gate import should_skip_code4_atr
 from open_freeze import in_open_freeze_window
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
+from entry_guard import entry_past_target  # skip entries whose live fill is already past target (RR≤0)
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
 import order_reject
@@ -70,6 +71,11 @@ FVG_30M_REQUIRE_BIAS   = os.getenv("FVG_30M_REQUIRE_BIAS", "0") == "1"
 #
 # State: reads daily_closes.json from trader dir. Populate via update_daily_close.py
 # sidecar (run after each day-session close, or cron at 13:50 TW).
+# Fill-past-target entry guard (2026-06-08): skip an entry whose live market price is already
+# at/through its target (RR≤0 — the FVG gap-open pathology, 6/8 09:56 fill 43121 past target
+# 43017 → +6 real vs +214 signal-fiction). Default ON; all sources (MTX is a structural no-op).
+# Disable with .env ENTRY_PAST_TARGET_GUARD=0.
+ENTRY_PAST_TARGET_GUARD    = os.getenv("ENTRY_PAST_TARGET_GUARD", "1") == "1"
 REGIME_GATE_ENABLED        = os.getenv("REGIME_GATE_DOWNTREND_BLOCK", "0") == "1"
 REGIME_GATE_SMA_DAYS       = int(os.getenv("REGIME_GATE_SMA_DAYS", "20"))
 REGIME_GATE_SLOPE_DAYS     = int(os.getenv("REGIME_GATE_SLOPE_DAYS", "10"))
@@ -306,6 +312,7 @@ class MTXStrategy:
         self._pending_fills: List[dict] = []
         self._pending_exit_records: List[dict] = []   # task B: prepared trade records awaiting real exit fill
         self._fill_anchor: bool         = os.getenv("FILL_ANCHOR", "0") == "1"
+        self._last_price: Optional[float] = None   # latest tick price, for the past-target entry guard
 
         if dry_run:
             logger.info("[DRY RUN] Strategy in simulation mode — no real orders")
@@ -422,7 +429,8 @@ class MTXStrategy:
                     f"regime_gate={'ON' if REGIME_GATE_ENABLED else 'off'} "
                     f"(SMA={REGIME_GATE_SMA_DAYS}d slope={REGIME_GATE_SLOPE_DAYS}d thr={REGIME_GATE_THRESHOLD_PTS}pts; "
                     f"daily_closes={'present' if DAILY_CLOSES_PATH.exists() else 'MISSING'}) | "
-                    f"fill_anchor={'ON' if self._fill_anchor else 'off'}")
+                    f"fill_anchor={'ON' if self._fill_anchor else 'off'} | "
+                    f"past_target_guard={'ON' if ENTRY_PAST_TARGET_GUARD else 'off'}")
 
     def stop(self):
         self._running = False
@@ -505,6 +513,7 @@ class MTXStrategy:
 
     def on_tick(self, price: float):
         self._tick_wd.record_tick(time.time())   # stamp BEFORE the flat early-return below
+        self._last_price = price                 # latest market price, for the past-target entry guard
         # Session-open freeze: skip exit checks too (carried position waits out the
         # opening spike). Watchdog stamp above is kept so the freeze doesn't look
         # like a dead feed. Stop-loss is intentionally dormant during the window.
@@ -1613,6 +1622,25 @@ class MTXStrategy:
             label = "加碼" if is_pyramid else "進場"
             logger.warning(f"Daily MAX LOSS lock active — refusing {source} {label} signal id={trade.get('id')}")
             # No Telegram per rejection (would spam); original lock-trigger msg is enough
+            return
+
+        # Fill-past-target guard (2026-06-08): if the live market is already at/through this
+        # trade's target, the reward is gone before we enter — a market order can only break
+        # even or lose (the FVG gap-open pathology). Skip WITHOUT placing the order or
+        # registering the unit. Real entries only; MTX is a structural no-op; fail-open on
+        # missing price/target (entry_past_target returns False). See entry_guard.py.
+        if place_order and ENTRY_PAST_TARGET_GUARD and entry_past_target(
+                direction, self._last_price, trade.get("target")):
+            label = "加碼" if is_pyramid else "進場"
+            logger.warning(
+                f"{source.upper()} {label} SKIPPED past-target | dir={direction} "
+                f"price={self._last_price} target={trade.get('target')} id={trade.get('id')}")
+            threading.Thread(
+                target=self._safe_health_notify,
+                args=(f"🚫 <b>{source.upper()} {label}跳過(市價已過目標)</b>\n"
+                      f"{direction} 市價 {self._last_price} 已達/過目標 {trade.get('target')}"
+                      f"，RR 已失 → 不進場。id={trade.get('id')}",),
+                daemon=True).start()
             return
 
         if place_order:
