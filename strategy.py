@@ -175,10 +175,19 @@ SOURCE_TAG  = {"mtx": "[MTX] ", "fvg": "[FVG] "}  # Both sources tagged for Tele
 
 
 def _get_session(dt: datetime) -> str:
+    # Weekday-aware (2026-06-09): the night session runs 15:00 day D -> 05:00 day D+1
+    # for trading days D in Mon-Fri, so the early-morning leg (t < 05:00) is only a
+    # real session on Tue-Sat. Without this, Monday 00:00-05:00 was mislabeled "night"
+    # while the broker feed is legitimately dead (maintenance to ~07:20), which tripped
+    # the tick watchdog (would-fire kill observed 2026-06-08 00:00). See
+    # docs/superpowers/specs/2026-06-09-monday-dawn-session-gating-design.md
     t = dt.time()
-    if dtime(8, 45) <= t < dtime(13, 45):
+    wd = dt.weekday()                                   # Mon=0 .. Sun=6
+    if dtime(8, 45) <= t < dtime(13, 45) and wd <= 4:   # day: Mon-Fri 08:45-13:45
         return "day"
-    if t >= dtime(15, 0) or t < dtime(5, 0):
+    if t >= dtime(15, 0) and wd <= 4:                   # night start leg: Mon-Fri 15:00+
+        return "night"
+    if t < dtime(5, 0) and 1 <= wd <= 5:                # night tail leg: Tue-Sat 00:00-05:00
         return "night"
     return "break"
 
