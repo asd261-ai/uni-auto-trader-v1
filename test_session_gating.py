@@ -91,6 +91,6 @@ class WatchdogMondayDawnGatingTest(unittest.TestCase):
         wd.check(100.0, session, False, msgs.append,
                  uptime=57651.0, on_kill=kills.append)   # enter session, age=0, no fire
         wd.check(7300.0, session, False, msgs.append,
-                 uptime=57651.0, on_kill=kills.append)   # 7200s stale > kill 600s -> fire
+                 uptime=57651.0, on_kill=kills.append)   # age=7300-100=7200s > kill 600s -> fire
         self.assertNotEqual(msgs, [])
         self.assertNotEqual(kills, [])

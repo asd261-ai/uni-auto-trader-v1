@@ -188,6 +188,7 @@ def _get_session(dt: datetime) -> str:
     if t >= dtime(15, 0) and wd <= 4:                   # night start leg: Mon-Fri 15:00+
         return "night"
     if t < dtime(5, 0) and 1 <= wd <= 5:                # night tail leg: Tue-Sat 00:00-05:00
+        # Sat (wd=5) is included: it's the continuation of Friday's 15:00 night start.
         return "night"
     return "break"
 
