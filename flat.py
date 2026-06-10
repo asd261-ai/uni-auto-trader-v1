@@ -4,6 +4,11 @@
     python3 flat.py BUY 1      # 以 BUY 1 口平掉 short 持倉
     python3 flat.py SELL 1     # 以 SELL 1 口平掉 long 持倉
     python3 flat.py BUY 2      # 平 2 口(例如 MTX short 1 + FVG short 1)
+    python3 flat.py --query    # 唯讀:登入印出 NET=<signed net> 後離開,不下單
+
+機器可讀輸出(Discord /flat 用):
+    --query 模式印 `NET=<n>`(B=+、S=-、0=平倉;讀不到印 NET=UNKNOWN 且 exit 2)
+    平倉模式收尾印 `RESID=<n>`(平完殘餘淨部位;RESID!=0 → exit 3,fail loud)
 
 必須在 bot 停止後執行(避免 API session 衝突):
     sudo systemctl stop uni-trader.service
@@ -22,6 +27,7 @@ import requests
 import logging
 from dotenv import load_dotenv
 from config import CONFIG
+from flat_query import UNKNOWN, query_net
 from unitrade.unitrade import Unitrade, DOrderObject
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -40,38 +46,52 @@ def send_tg(token: str, chat_id: str, text: str):
 
 
 # ── CLI 參數解析 ──
-if len(sys.argv) != 3:
-    print(__doc__)
-    sys.exit(1)
+query_mode = len(sys.argv) == 2 and sys.argv[1] == "--query"
 
-bs_arg  = sys.argv[1].upper()
-qty_arg = int(sys.argv[2])
+if not query_mode:
+    if len(sys.argv) != 3:
+        print(__doc__)
+        sys.exit(1)
 
-if bs_arg not in ("BUY", "SELL"):
-    print(f"Invalid direction '{bs_arg}'. Must be BUY or SELL.")
-    sys.exit(1)
-if qty_arg < 1 or qty_arg > 10:
-    print(f"Invalid qty {qty_arg}. Must be 1-10 (sanity bound).")
-    sys.exit(1)
+    bs_arg  = sys.argv[1].upper()
+    qty_arg = int(sys.argv[2])
 
-bs_code = "B" if bs_arg == "BUY" else "S"
-bs_zh   = "買入" if bs_arg == "BUY" else "賣出"
+    if bs_arg not in ("BUY", "SELL"):
+        print(f"Invalid direction '{bs_arg}'. Must be BUY or SELL.")
+        sys.exit(1)
+    if qty_arg < 1 or qty_arg > 10:
+        print(f"Invalid qty {qty_arg}. Must be 1-10 (sanity bound).")
+        sys.exit(1)
 
-print(f"Plan: {bs_arg} {qty_arg} {CONFIG['product']} market (opencloseflag=1)")
-confirm = input("Confirm? [y/N] ").strip().lower()
-if confirm != "y":
-    print("Cancelled.")
-    sys.exit(0)
+    bs_code = "B" if bs_arg == "BUY" else "S"
+    bs_zh   = "買入" if bs_arg == "BUY" else "賣出"
 
-# ── 連線 + 下單 ──
+    print(f"Plan: {bs_arg} {qty_arg} {CONFIG['product']} market (opencloseflag=1)")
+    confirm = input("Confirm? [y/N] ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        sys.exit(0)
+
+# ── 連線 ──
 api = Unitrade()
 resp = api.login(CONFIG["url"], CONFIG["userid"], CONFIG["password"], CONFIG["ca_path"], CONFIG["ca_password"])
 if not resp.ok:
+    if query_mode:
+        print("NET=UNKNOWN")
     print(f"Login failed: {resp.error}")
-    sys.exit(1)
+    sys.exit(2 if query_mode else 1)
 
 actno = api.get_accounts()[0]
 print(f"Logged in | account={actno}")
+
+# ── --query:唯讀印 NET= 後離開,不下單 ──
+if query_mode:
+    net = query_net(api, actno, CONFIG["product"])
+    print(f"NET={net}")
+    api.logout()
+    sys.exit(0 if net != UNKNOWN else 2)
+
+# ── 下單 ──
 
 replies: list = []
 matches: list = []
@@ -123,6 +143,15 @@ match_qty   = matches[0].matchqty    if matches else 0
 
 print(f"\nResult | status={status} orderno={orderno} match_price={match_price} qty={match_qty}")
 
+# ── 殘餘部位驗證(RESID=):用同一個 broker session 重讀,最多 poll 5 秒 ──
+resid = query_net(api, actno, CONFIG["product"])
+for _ in range(10):
+    if resid == 0:
+        break
+    time.sleep(0.5)
+    resid = query_net(api, actno, CONFIG["product"])
+print(f"RESID={resid}")
+
 # Telegram 通知
 tg_token   = CONFIG.get("telegram_token", "")
 tg_chat_id = CONFIG.get("telegram_chat_id", "")
@@ -135,7 +164,8 @@ if tg_token and tg_chat_id:
         f"委託狀態:{status}\n"
         f"委託書號:{orderno}\n"
         f"成交價:{match_price if match_price else '待確認'}\n"
-        f"成交口數:{match_qty}"
+        f"成交口數:{match_qty}\n"
+        f"殘餘淨部位:{resid}"
     )
     send_tg(tg_token, tg_chat_id, msg)
     print("Telegram sent")
@@ -144,3 +174,4 @@ else:
 
 api.logout()
 print("Done")
+sys.exit(0 if resid == 0 else 3)   # RESID!=0 / UNKNOWN → fail loud,呼叫端必須人工檢查
