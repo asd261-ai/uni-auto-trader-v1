@@ -124,6 +124,7 @@ order_resp = api.dtrade.order(order)
 print(f"issend={order_resp.issend} seq={order_resp.seq} err={order_resp.errormsg}")
 
 if not order_resp.issend:
+    print("RESID=UNKNOWN")   # 沒下成單,殘餘部位未驗證 — 呼叫端必須人工檢查
     print("Order failed, exiting")
     api.logout()
     sys.exit(1)
@@ -143,13 +144,13 @@ match_qty   = matches[0].matchqty    if matches else 0
 
 print(f"\nResult | status={status} orderno={orderno} match_price={match_price} qty={match_qty}")
 
-# ── 殘餘部位驗證(RESID=):用同一個 broker session 重讀,最多 poll 5 秒 ──
-resid = query_net(api, actno, CONFIG["product"])
+# ── 殘餘部位驗證(RESID=):用同一個 broker session 重讀,最多 10 次/約 5 秒 ──
+resid = UNKNOWN
 for _ in range(10):
+    resid = query_net(api, actno, CONFIG["product"])
     if resid == 0:
         break
     time.sleep(0.5)
-    resid = query_net(api, actno, CONFIG["product"])
 print(f"RESID={resid}")
 
 # Telegram 通知
