@@ -1,11 +1,15 @@
 """
-READ-ONLY 調查:登入 viploginm → 查 MXF 商品檔 + 合約檔 → 印出近月真實 prod_id。
-不送任何委託。用來確認 viploginm 正確的下單/報價代號(取代被拒的別名 MXFG5)。
+READ-ONLY 調查:登入正式環境 → 查 MXF 商品檔 + 合約檔 → 印出近月真實 prod_id。
+不送任何委託。用來確認正確的下單/報價代號(取代被拒的別名 MXFG5)。
+URL 讀 .env UNITRADE_URL(同 trader 本體;未設 fallback 現役 viploginb)。
 """
+import os
+from dotenv import load_dotenv
 from unitrade.unitrade import Unitrade
 from config import CONFIG
 
-LIVE_URL = "https://viploginm.pfctrade.com"
+load_dotenv()
+LIVE_URL = os.environ.get("UNITRADE_URL") or "https://viploginb.pfctrade.com"
 BASE = "MXF"  # 小台指
 
 api = Unitrade()

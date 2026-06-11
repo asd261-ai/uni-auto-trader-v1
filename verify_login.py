@@ -1,9 +1,10 @@
 """
-Login-only 驗證腳本:登入 viploginm 正式環境 → 抓帳號 → 登出。
-NO ORDER SENT. 用 .env 既有帳密/憑證,只 override URL 成正式登入伺服器。
-輸出只印登入結果與遮罩後帳號,不印任何 secret value。
+Login-only 驗證腳本:登入正式環境 → 抓帳號 → 登出。
+NO ORDER SENT. 用 .env 既有帳密/憑證與 UNITRADE_URL(同 trader 本體,免雙處維護;
+未設時 fallback 現役 viploginb)。輸出只印登入結果與遮罩後帳號,不印任何 secret value。
 """
 import logging
+import os
 from dotenv import load_dotenv
 from config import CONFIG
 from unitrade.unitrade import Unitrade
@@ -15,7 +16,7 @@ logging.basicConfig(
 )
 load_dotenv()
 
-LIVE_URL = "https://viploginm.pfctrade.com"
+LIVE_URL = os.environ.get("UNITRADE_URL") or "https://viploginb.pfctrade.com"
 
 
 def _mask(s: str) -> str:
