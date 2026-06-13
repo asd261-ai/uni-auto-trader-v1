@@ -1414,6 +1414,31 @@ class MTXStrategy:
                 # 'undefined' fails-open: if no daily_closes.json or insufficient
                 # history, we DON'T block (safer when data is unavailable)
 
+            # Per-code demote (env-gated; default OFF). MTX signals whose code
+            # is in MTX_DEMOTE_CODES are silent-absorbed across all sessions /
+            # both directions — the Worker still records them in history as a
+            # paper trade for re-promote evaluation. Broadest signal-level gate,
+            # so it runs before the direction-specific ATR/half-size skips.
+            # Pyramid path returns earlier (canPyramid handled above), so this
+            # only gates NEW entries — demoted code may still add as pyramid #2.
+            # Spec: docs/superpowers/specs/2026-06-13-mtx-code2-demote-design.md
+            if source == "mtx" and should_demote(trade.get("sigCode"), MTX_DEMOTE_CODES):
+                logger.info(
+                    f"MTX demote skip | code={trade.get('sigCode')} "
+                    f"dir={direction} session={self._current_session} "
+                    f"id={trade_id} entry={trade.get('entry')}"
+                )
+                _demote_msg = (
+                    f"🚫 Demoted | code{trade.get('sigCode')} {direction}"
+                    f" [{self._current_session}]"
+                    f"\nentry={trade.get('entry')} id={trade_id}"
+                )
+                threading.Thread(
+                    target=self._safe_health_notify, args=(_demote_msg,), daemon=True
+                ).start()
+                self._last_seen_id[source] = trade_id
+                continue
+
             # Code-4 ATR-gated skip (env-gated; default OFF; **night-only**
             # since 2026-05-28). Fires BEFORE HALF_SIZE so ATR-skipped signals
             # don't increment the half-size counter. Pure function in atr_gate.py
