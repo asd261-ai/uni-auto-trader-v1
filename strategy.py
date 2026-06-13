@@ -1419,8 +1419,10 @@ class MTXStrategy:
             # both directions — the Worker still records them in history as a
             # paper trade for re-promote evaluation. Broadest signal-level gate,
             # so it runs before the direction-specific ATR/half-size skips.
-            # Pyramid path returns earlier (canPyramid handled above), so this
-            # only gates NEW entries — demoted code may still add as pyramid #2.
+            # This fires before the pyramid branch (line ~1503), so a demoted
+            # code is skipped entirely — including pyramid adds. Intentional:
+            # a negative-expectancy signal must not add risk in any form. Matches
+            # the regime/ATR-skip gates, which also continue before the pyramid.
             # Spec: docs/superpowers/specs/2026-06-13-mtx-code2-demote-design.md
             if source == "mtx" and should_demote(trade.get("sigCode"), MTX_DEMOTE_CODES):
                 logger.info(
