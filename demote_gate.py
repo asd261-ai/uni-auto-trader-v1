@@ -39,7 +39,7 @@ def should_demote(sig_code, demote_codes):
         return sig_code in demote_codes
     if isinstance(sig_code, str):
         s = sig_code.strip()
-        if s.lstrip("-").isdigit():
+        if s.isdigit():  # positive digits only; "-2"/""/"abc" → fail-open
             return int(s) in demote_codes
         return False  # non-numeric string → fail-open
     return False  # float / None / anything else → fail-open

@@ -55,6 +55,21 @@ class DemoteGateTest(unittest.TestCase):
         # Worker sends integer codes; a float is unexpected → fail-open.
         self.assertFalse(should_demote(2.0, frozenset({2})))
 
+    def test_negative_string_does_not_demote(self):
+        # MTX codes are positive 0-8; a negative string must fail-open even if
+        # the (mis-configured) set somehow contains it. Set holds -2 so this
+        # test actually exercises the lstrip("-") bug (which would parse "-2"
+        # and match); positive-only isdigit() must reject it.
+        self.assertFalse(should_demote("-2", frozenset({-2})))
+
+    def test_false_bool_does_not_demote(self):
+        # False==0 — mirror of the True==1 guard; bool must never be a code.
+        self.assertFalse(should_demote(False, frozenset({0})))
+
+    def test_none_demote_codes_is_safe(self):
+        # Caller mistake: None instead of empty frozenset must fail-open, not raise.
+        self.assertFalse(should_demote(2, None))
+
 
 if __name__ == "__main__":
     unittest.main()
