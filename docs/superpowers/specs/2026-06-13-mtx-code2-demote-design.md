@@ -23,7 +23,7 @@
 | 機制 | trader 端 env-gated per-code skip(`MTX_DEMOTE_CODES`) |
 | paper 延續 | Worker history 不受影響,② 照 fire 照記=自動 paper 帳(6/12 鎖定夜已實證此機制) |
 | 通知 | Health Bot 每筆通知(Sean 6/13 選定,比照 ④ ATR skip 部署期慣例) |
-| pyramid | 不擋加碼路徑(與 regime gate / HALF_SIZE carve-out 一致,明文接受) |
+| pyramid | demote gate 在加碼分支(strategy.py ~1503)之前 continue,故連加碼單(pyramid #2)一併擋掉,與 regime gate / ATR-skip gate 一致 |
 | 可逆性 | unset env + restart 即還原 |
 
 淘汰方案:Worker 端 shouldFire blackout(gate 會讓交易不進 history,paper 帳斷頭=盲飛);Worker tag + trader 認 tag(橫跨兩系統,改動面大)。
@@ -63,7 +63,7 @@ pytest(`test_demote_gate.py`,比照 atr_gate 測試慣例,持久 commit 非 thro
 1. parse:未設/空/`"2"`/`"2,3"`/`" 2 , 3 "`/`"2,x,3"`(壞 token 忽略)/`"abc"`(全壞=空集合)
 2. should_demote:命中/不命中/sigCode None/sigCode 字串 `"2"`/空集合永遠 False
 3. strategy 整合:demote 命中時不進 `_enter`、last_seen 有推進;env 未設時行為與現行完全一致(回歸保護)
-4. pyramid 路徑不受影響(現有 pyramid 測試不變綠)
+4. pyramid 加碼分支在此閘之後(strategy.py ~1503),demoted code 會在到達加碼分支前被 continue 擋掉=連加碼一併停;與 regime/ATR-skip gate 一致。
 
 ## 5. 部署與驗收(ask-first,另拿 GO)
 
@@ -82,5 +82,5 @@ pytest(`test_demote_gate.py`,比照 atr_gate 測試慣例,持久 commit 非 thro
 ## 7. 風險與明文接受項
 
 - **趨勢參與減少**:② 是唯一突破追強腿,demote 後強趨勢段只剩 ⑧ 回踩參與(沒回踩=空手)。接受:期望值為負的參與不是參與。
-- **pyramid carve-out**:② 作為加碼單(#2)不被擋(已有獲利在手、風險性質不同、n 極小)。
+- **demote 全擋(含加碼)**:demote gate 在 pyramid 分支(strategy.py ~1503)之前 `continue`,故 demoted code 連加碼單(pyramid #2)一併擋掉,與 regime/ATR-skip gate 行為一致。設計取捨:既然判定該訊號期望值為負,任何形式的加碼(包含對既有獲利倉加碼)都不應放行;n 極小、無乾淨的「② 當加碼觸發」數據,從嚴。
 - **證據窗口無真 OOS**:n=31 混平靜+panic 週;但 demote 是移除風險非新增規則,且完全可逆,接受較低證據門檻。
