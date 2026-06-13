@@ -17,6 +17,7 @@ from margin_headroom import headroom_low
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
 from atr_gate import should_skip_code4_atr
+from demote_gate import should_demote
 from open_freeze import in_open_freeze_window
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
 from entry_guard import entry_past_target  # skip entries whose live fill is already past target (RR≤0)
@@ -103,6 +104,15 @@ try:
     SKIP_CODE_4_ATR_GT = int(os.getenv("MTX_SKIP_CODE_4_ATR_GT", "0") or "0")
 except (ValueError, TypeError):
     SKIP_CODE_4_ATR_GT = 0
+
+# Per-code demote (manual switch; default OFF). MTX signals whose code is in
+# MTX_DEMOTE_CODES are silent-absorbed (no order) across ALL sessions / both
+# directions, while the Worker keeps firing them into history as a paper record.
+# Mirrors the HALF_SIZE_CODES parse: non-digit tokens dropped, empty → disabled.
+# First demoted: ② 突破進場 (real-fill mean -22.9/trade, CI excludes 0; filter
+# rescue routes all NO-GO). Set via .env e.g. MTX_DEMOTE_CODES=2 ; empty → off.
+# Spec: docs/superpowers/specs/2026-06-13-mtx-code2-demote-design.md
+MTX_DEMOTE_CODES = {int(c) for c in os.getenv("MTX_DEMOTE_CODES", "").split(",") if c.strip().isdigit()}
 
 # Session-open trading freeze (Sean 2026-05-30). FULL freeze: no entry AND no exit
 # in the first OPEN_FREEZE_SECS after a session open (day 08:45, night 15:00 TW) —
