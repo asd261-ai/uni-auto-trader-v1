@@ -70,6 +70,34 @@ class DemoteGateTest(unittest.TestCase):
         # Caller mistake: None instead of empty frozenset must fail-open, not raise.
         self.assertFalse(should_demote(2, None))
 
+    # --- Env parse mirrors HALF_SIZE_CODES: bad tokens dropped, empty → off ---
+    def test_env_parse_empty_string_is_disabled(self):
+        raw = ""
+        parsed = {int(c) for c in raw.split(",") if c.strip().isdigit()}
+        self.assertEqual(parsed, set())
+        self.assertFalse(should_demote(2, parsed))
+
+    def test_env_parse_single_code(self):
+        raw = "2"
+        parsed = {int(c) for c in raw.split(",") if c.strip().isdigit()}
+        self.assertEqual(parsed, {2})
+        self.assertTrue(should_demote(2, parsed))
+
+    def test_env_parse_multi_and_spaces(self):
+        raw = " 2 , 3 "
+        parsed = {int(c) for c in raw.split(",") if c.strip().isdigit()}
+        self.assertEqual(parsed, {2, 3})
+
+    def test_env_parse_drops_bad_tokens(self):
+        raw = "2,x,3"
+        parsed = {int(c) for c in raw.split(",") if c.strip().isdigit()}
+        self.assertEqual(parsed, {2, 3})
+
+    def test_env_parse_all_bad_is_disabled(self):
+        raw = "abc"
+        parsed = {int(c) for c in raw.split(",") if c.strip().isdigit()}
+        self.assertEqual(parsed, set())
+
 
 if __name__ == "__main__":
     unittest.main()
