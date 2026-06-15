@@ -23,6 +23,7 @@ import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /
 from entry_guard import entry_past_target  # skip entries whose live fill is already past target (RR≤0)
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
+from disconnect_watchdog import DisconnectStormWatchdog
 import order_reject
 import real_fill_pnl  # task B: real-fill P&L fields for trades.jsonl
 
@@ -177,6 +178,12 @@ TICK_STALE_KILL_DAY_SEC   = int(os.getenv("TICK_STALE_KILL_DAY_SEC", "180"))
 TICK_STALE_KILL_NIGHT_SEC = int(os.getenv("TICK_STALE_KILL_NIGHT_SEC", "600"))
 TICK_STALE_KILL_GRACE_SEC = int(os.getenv("TICK_STALE_KILL_GRACE_SEC", "180"))
 TICK_STALE_KILL          = os.getenv("TICK_STALE_KILL", "off").lower() == "on"  # Phase B arms os._exit
+# Disconnect-storm circuit breaker: a broker reconnect storm recurses the SDK
+# native dispatch into a CPython C-stack overflow (SEGV ip 0x551368). Self-restart
+# cleanly before that point. Independent of TICK_STALE_KILL. Observe-default.
+DISCONNECT_STORM_KILL       = os.getenv("DISCONNECT_STORM_KILL", "off").lower() == "on"
+DISCONNECT_STORM_WINDOW_SEC = int(os.getenv("DISCONNECT_STORM_WINDOW_SEC", "120"))
+DISCONNECT_STORM_MAX        = int(os.getenv("DISCONNECT_STORM_MAX", "20"))
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
@@ -323,6 +330,10 @@ class MTXStrategy:
             kill_grace=TICK_STALE_KILL_GRACE_SEC,
             check_interval=TICK_CHECK_INTERVAL_SEC,
         )
+        self._disc_wd = DisconnectStormWatchdog(
+            window_sec=DISCONNECT_STORM_WINDOW_SEC,
+            max_disconnects=DISCONNECT_STORM_MAX,
+        )
 
         # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
         # order) so on_fill() attributes each Match to the right order even on
@@ -458,6 +469,14 @@ class MTXStrategy:
     # ── 斷線 / 重連 ───────────────────────────────────────────────
 
     def on_disconnect(self):
+        # Disconnect-storm circuit breaker (runs first, on every disconnect event).
+        # Active only inside a real trading session — _get_session is weekday-aware
+        # and returns "break" for weekends / Mon-dawn maintenance / break windows,
+        # so market-closed disconnects never trip a restart.
+        active = _get_session(datetime.now(TZ_TW)) != "break"
+        if self._disc_wd.record_and_check(time.time(), active=active):
+            self._disconnect_storm_kill(
+                f"{DISCONNECT_STORM_MAX} disconnects in {DISCONNECT_STORM_WINDOW_SEC}s (active session)")
         with self._lock:
             units = self._flatten_units()
         logger.warning(f"Disconnected | local units={len(units)}")
@@ -1982,6 +2001,21 @@ class MTXStrategy:
         logger.error(f"[tick-wd KILL] {msg}")
         try:
             self._safe_health_notify(f"🔪 Trader self-restart: {msg}")
+        except Exception:
+            pass
+        import os as _os
+        _os._exit(1)
+
+    def _disconnect_storm_kill(self, msg: str) -> None:
+        # Phase A (DISCONNECT_STORM_KILL off): observe only — log the would-fire, do NOT exit.
+        # Phase B (on): alert then exit so systemd restarts BEFORE the SDK native
+        # reconnect recursion overflows the C stack (SEGV ip 0x551368).
+        if not DISCONNECT_STORM_KILL:
+            logger.error(f"[disc-storm KILL would-fire] {msg}")
+            return
+        logger.error(f"[disc-storm KILL] {msg}")
+        try:
+            self._safe_health_notify(f"🔪 Trader self-restart (disconnect storm): {msg}")
         except Exception:
             pass
         import os as _os
