@@ -22,6 +22,15 @@ the storm's breadth — suppressing them here would lose that signal.
 
 Side effects (process exit, env, Telegram) live in strategy.py, not here.
 
+Thread safety
+-------------
+This class holds no internal lock.  `_events` (a deque) and `_last_ts` are
+accessed without synchronisation.  The design assumes the caller invokes
+`record_and_check` from a single thread (the broker SDK's callback thread in
+the standard deployment).  If the caller might invoke it concurrently, the
+caller must serialise access externally (e.g. wrap each call in a threading
+lock).
+
 Monotonic timestamp guarantee
 ------------------------------
 `record_and_check` enforces that stored timestamps never go backwards.  If the
@@ -87,9 +96,18 @@ class DisconnectStormWatchdog:
     def reset(self) -> None:
         """Clear the event window and the monotonic anchor.
 
-        Call after a confirmed clean reconnect or any intentional restart of the
-        detection cycle.  Resets _last_ts so that the subsequent timestamp
-        sequence is not anchored to a stale (possibly far-future) value.
+        Intentionally NOT wired to on_reconnect.  This class operates as a
+        pure sliding window: rapid flapping (disconnect ↔ reconnect in quick
+        succession) must accumulate in the window to trigger the breaker.
+        Resetting on every reconnect would drain the counter before it reaches
+        the threshold, rendering the breaker ineffective against the exact
+        storm it is designed to catch (high-frequency cycling causes the SDK
+        to overflow the CPython C stack regardless of reconnect interleaving).
+        Only the passage of time ages events out via the window.
+
+        Use reset() in tests or when intentionally restarting the entire
+        detection lifecycle (e.g. a clean process restart).  Resets _last_ts
+        so the subsequent timestamp sequence is not anchored to a stale value.
         """
         self._events.clear()
         self._last_ts = float("-inf")

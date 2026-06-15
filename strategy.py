@@ -473,6 +473,9 @@ class MTXStrategy:
         # Active only inside a real trading session — _get_session is weekday-aware
         # and returns "break" for weekends / Mon-dawn maintenance / break windows,
         # so market-closed disconnects never trip a restart.
+        # Thread-safety: the SDK dispatches on_disconnect on a single callback
+        # thread, so _disc_wd's unlocked deque is safe.  If a future SDK upgrade
+        # dispatches callbacks concurrently, revisit (add a lock around record_and_check).
         active = _get_session(datetime.now(TZ_TW)) != "break"
         if self._disc_wd.record_and_check(time.time(), active=active):
             self._disconnect_storm_kill(
