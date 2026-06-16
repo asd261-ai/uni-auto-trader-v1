@@ -23,6 +23,7 @@ import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /
 from entry_guard import entry_past_target  # skip entries whose live fill is already past target (RR≤0)
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
+from pollloop_watchdog import PollLoopLivenessWatchdog
 from disconnect_watchdog import DisconnectStormWatchdog
 import order_reject
 import real_fill_pnl  # task B: real-fill P&L fields for trades.jsonl
@@ -184,6 +185,13 @@ TICK_STALE_KILL          = os.getenv("TICK_STALE_KILL", "off").lower() == "on"  
 DISCONNECT_STORM_KILL       = os.getenv("DISCONNECT_STORM_KILL", "off").lower() == "on"
 DISCONNECT_STORM_WINDOW_SEC = int(os.getenv("DISCONNECT_STORM_WINDOW_SEC", "120"))
 DISCONNECT_STORM_MAX        = int(os.getenv("DISCONNECT_STORM_MAX", "20"))
+# Poll-loop liveness watchdog: detects a wedged _poll_loop (frozen on a hung
+# broker SDK call) that the in-loop tick-stale watchdog cannot see. Observe by
+# default; POLLLOOP_FREEZE_KILL=on arms os._exit. See design spec 2026-06-17.
+POLLLOOP_FREEZE_SEC       = int(os.getenv("POLLLOOP_FREEZE_SEC", "120"))
+POLLLOOP_FREEZE_CHECK_SEC = int(os.getenv("POLLLOOP_FREEZE_CHECK_SEC", "30"))
+POLLLOOP_FREEZE_GRACE_SEC = int(os.getenv("POLLLOOP_FREEZE_GRACE_SEC", "180"))
+POLLLOOP_FREEZE_KILL      = os.getenv("POLLLOOP_FREEZE_KILL", "off").lower() == "on"
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
@@ -274,6 +282,7 @@ class MTXStrategy:
         # with env FVG_BOOT_FLOOR=0.
         self._fvg_boot_ts_ms:        int  = int(time.time() * 1000)
         self._proc_start_ts: float = time.time()  # wall-clock boot, for tick-wd kill grace
+        self._proc_start_monotonic = time.monotonic()   # monotonic boot anchor for liveness uptime
         self._fvg_boot_floor_enabled: bool = os.getenv("FVG_BOOT_FLOOR", "1") != "0"
 
         # Option C: 30m bias filter cache. _get_fvg_30m_bias() queries
@@ -333,6 +342,14 @@ class MTXStrategy:
         self._disc_wd = DisconnectStormWatchdog(
             window_sec=DISCONNECT_STORM_WINDOW_SEC,
             max_disconnects=DISCONNECT_STORM_MAX,
+        )
+        # Poll-loop liveness watchdog: detect a wedged _poll_loop (frozen on a hung
+        # broker SDK call) from its OWN thread — the in-loop tick-stale watchdog can't
+        # see a freeze it is itself stuck inside. Observe-default; see pollloop_watchdog.py.
+        self._pollloop_wd = PollLoopLivenessWatchdog(
+            freeze_threshold=POLLLOOP_FREEZE_SEC,
+            check_interval=POLLLOOP_FREEZE_CHECK_SEC,
+            kill_grace=POLLLOOP_FREEZE_GRACE_SEC,
         )
 
         # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
@@ -452,6 +469,7 @@ class MTXStrategy:
         self._running = True
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
+        threading.Thread(target=self._pollloop_wd_loop, daemon=True).start()
         logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s | "
                     f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE} | "
                     f"fvg_boot_ts={self._fvg_boot_ts_ms} "
@@ -736,7 +754,22 @@ class MTXStrategy:
                 # (shared account) don't pollute the reported real P&L.
                 **pnl_calc.heartbeat_fields(base=self.trader.config["product"]),
             })
+            self._pollloop_wd.record_poll_complete(time.monotonic())
             time.sleep(POLL_INTERVAL)
+
+    def _pollloop_wd_loop(self) -> None:
+        # Runs in its OWN daemon thread, never the poll loop — so a wedged poll loop
+        # cannot freeze the watchdog. Touches no broker SDK / network.
+        while self._running:
+            try:
+                self._pollloop_wd.check(
+                    time.monotonic(),
+                    uptime=time.monotonic() - self._proc_start_monotonic,
+                    on_kill=self._pollloop_wd_kill,
+                )
+            except Exception as e:
+                logger.debug(f"pollloop-wd error (silent): {e}")
+            time.sleep(POLLLOOP_FREEZE_CHECK_SEC)
 
     def _check_session_change(self):
         now     = datetime.now(TZ_TW)
@@ -2019,6 +2052,20 @@ class MTXStrategy:
         logger.error(f"[disc-storm KILL] {msg}")
         try:
             self._safe_health_notify(f"🔪 Trader self-restart (disconnect storm): {msg}")
+        except Exception:
+            pass
+        import os as _os
+        _os._exit(1)
+
+    def _pollloop_wd_kill(self, msg: str) -> None:
+        # Observe (POLLLOOP_FREEZE_KILL off): log the would-fire, do NOT exit.
+        # Armed (on): alert then os._exit(1) so systemd restarts the wedged process.
+        if not POLLLOOP_FREEZE_KILL:
+            logger.error(f"[pollloop-wd KILL would-fire] {msg}")
+            return
+        logger.error(f"[pollloop-wd KILL] {msg}")
+        try:
+            self._safe_health_notify(f"🔪 Trader self-restart (poll-loop freeze): {msg}")
         except Exception:
             pass
         import os as _os
