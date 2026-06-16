@@ -10,7 +10,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-17-pollloop-liveness-watchdog-design.md`
 
-**Conventions:** modules are flat at repo root (`strategy.py`, `trader.py`, `tick_watchdog.py`, …); tests are flat `test_<module>.py`; run with `python -m pytest`. Pure watchdog modules pass all time in from the caller and never sleep in tests (mirror `tick_watchdog.py` / `disconnect_watchdog.py`).
+**Conventions:** modules are flat at repo root (`strategy.py`, `trader.py`, `tick_watchdog.py`, …); tests are flat `test_<module>.py`. Pure watchdog modules pass all time in from the caller and never sleep in tests (mirror `tick_watchdog.py` / `disconnect_watchdog.py`).
+
+> **CORRECTION (test runner):** this repo uses **pure stdlib `unittest`, no deps** — every test is a `unittest.TestCase` run with `python3 -m unittest test_<module> -v` on system `python3`. Wherever a step below says `python -m pytest <file>`, instead run `python3 -m unittest <module> -v`, and write tests as `unittest.TestCase` (no `import pytest`). Task 1's test was corrected to this form (commit 03c6f10). The Task 2 test block below is already in unittest form.
 
 **Out of scope (Phase 2, separate plan):** broker *write* timeout (`buy`/`sell`/`replace_order`) + phantom-fill reconciliation.
 
@@ -223,41 +225,48 @@ git commit -m "feat(watchdog): pure poll-loop liveness detector + unit tests"
 Create `test_sdk_timeout.py`:
 
 ```python
+"""Tests for sdk_timeout. Pure stdlib unittest (runs on system python3, no deps).
+Run:  python3 -m unittest test_sdk_timeout -v
+"""
+from __future__ import annotations
+
 import time
-import pytest
+import unittest
+
 from sdk_timeout import call_with_timeout, SDKCallTimeout
 
 
-def test_returns_value_when_fast():
-    assert call_with_timeout(lambda: 42, timeout=1.0) == 42
+class CallWithTimeoutTests(unittest.TestCase):
+    def test_returns_value_when_fast(self):
+        self.assertEqual(call_with_timeout(lambda: 42, timeout=1.0), 42)
+
+    def test_passes_args_and_kwargs(self):
+        self.assertEqual(call_with_timeout(lambda a, b: a + b, 2, b=3, timeout=1.0), 5)
+
+    def test_raises_on_timeout(self):
+        def slow():
+            time.sleep(5)
+        with self.assertRaises(SDKCallTimeout):
+            call_with_timeout(slow, timeout=0.1)
+
+    def test_propagates_fn_exception(self):
+        def boom():
+            raise ValueError("nope")
+        with self.assertRaises(ValueError):
+            call_with_timeout(boom, timeout=1.0)
+
+    def test_stuck_call_does_not_block_next_call(self):
+        def slow():
+            time.sleep(2)
+        t0 = time.monotonic()
+        with self.assertRaises(SDKCallTimeout):
+            call_with_timeout(slow, timeout=0.1)             # abandons the stuck thread
+        self.assertEqual(call_with_timeout(lambda: "ok", timeout=0.5), "ok")  # next call works at once
+        self.assertLess(time.monotonic() - t0, 1.5)          # didn't wait for the 2s stuck call
 
 
-def test_passes_args_and_kwargs():
-    assert call_with_timeout(lambda a, b: a + b, 2, b=3, timeout=1.0) == 5
-
-
-def test_raises_on_timeout():
-    def slow():
-        time.sleep(5)
-    with pytest.raises(SDKCallTimeout):
-        call_with_timeout(slow, timeout=0.1)
-
-
-def test_propagates_fn_exception():
-    def boom():
-        raise ValueError("nope")
-    with pytest.raises(ValueError):
-        call_with_timeout(boom, timeout=1.0)
-
-
-def test_stuck_call_does_not_block_next_call():
-    def slow():
-        time.sleep(2)
-    t0 = time.monotonic()
-    with pytest.raises(SDKCallTimeout):
-        call_with_timeout(slow, timeout=0.1)            # abandons the stuck thread
-    assert call_with_timeout(lambda: "ok", timeout=0.5) == "ok"   # next call works at once
-    assert time.monotonic() - t0 < 1.5                   # didn't wait for the 2s stuck call
+if __name__ == "__main__":
+    unittest.main()
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
