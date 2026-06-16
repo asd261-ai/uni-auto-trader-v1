@@ -5,6 +5,9 @@ from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 import order_log
 from feed_schema import parse_broker_position, parse_fill, SCHEMA_FAIL
 from order_reject import is_reject_status
+from sdk_timeout import call_with_timeout, SDKCallTimeout
+
+SDK_READ_TIMEOUT_SEC = float(os.getenv("SDK_READ_TIMEOUT_SEC", "5"))
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +176,14 @@ class AutoTrader:
         DPositionResponse has fields (ok, error, data=[DPosition,...]).
         """
         try:
-            resp = self.api.daccount.get_position(self.actno)
+            try:
+                resp = call_with_timeout(
+                    self.api.daccount.get_position, self.actno,
+                    timeout=SDK_READ_TIMEOUT_SEC,
+                )
+            except SDKCallTimeout:
+                logger.error(f"broker get_position timed out after {SDK_READ_TIMEOUT_SEC}s — skipping recon cycle")
+                return SCHEMA_FAIL
             if not resp or not getattr(resp, "ok", False):
                 err = getattr(resp, "error", "unknown") if resp else "no response"
                 logger.warning(f"Position query: broker not ok ({err})")
@@ -212,7 +222,14 @@ class AutoTrader:
         "no reliable read" and does NOT alert — fail-safe).
         """
         try:
-            resp = self.api.daccount.get_margin(self.actno, currency)
+            try:
+                resp = call_with_timeout(
+                    self.api.daccount.get_margin, self.actno, currency,
+                    timeout=SDK_READ_TIMEOUT_SEC,
+                )
+            except SDKCallTimeout:
+                logger.error(f"broker get_margin timed out after {SDK_READ_TIMEOUT_SEC}s — skipping margin cycle")
+                return None
             if not resp or not getattr(resp, "ok", False):
                 err = getattr(resp, "error", "unknown") if resp else "no response"
                 logger.debug(f"Margin query: broker not ok ({err})")

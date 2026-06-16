@@ -192,6 +192,9 @@ POLLLOOP_FREEZE_SEC       = int(os.getenv("POLLLOOP_FREEZE_SEC", "120"))
 POLLLOOP_FREEZE_CHECK_SEC = int(os.getenv("POLLLOOP_FREEZE_CHECK_SEC", "30"))
 POLLLOOP_FREEZE_GRACE_SEC = int(os.getenv("POLLLOOP_FREEZE_GRACE_SEC", "180"))
 POLLLOOP_FREEZE_KILL      = os.getenv("POLLLOOP_FREEZE_KILL", "off").lower() == "on"
+# Consecutive broker-read-unavailable (schema-drift or SDK timeout, both surface
+# as SCHEMA_FAIL from _query_broker_position) streak before a Health-bot alert.
+SDK_READ_TIMEOUT_ALERT_N  = int(os.getenv("SDK_READ_TIMEOUT_ALERT_N", "3"))
 
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
@@ -323,6 +326,7 @@ class MTXStrategy:
         self._recon_mismatch_since:  Optional[float]        = None   # when mismatch first observed
         self._recon_alert_sent:      bool                   = False  # one-shot dedup
         self._recon_schema_alert_sent: bool                 = False  # one-shot dedup for SDK schema drift
+        self._sdk_read_timeout_streak: int                  = 0      # consecutive broker-read-unavailable (schema-drift / SDK timeout)
         self._recon_last_broker_net: Optional[int]          = None   # last observed broker signed net (for heartbeat)
         self._recon_last_expected:   Optional[int]          = None   # last computed expected signed net
         # Shared-account margin headroom monitor (alert-only, never touches orders)
@@ -1108,9 +1112,19 @@ class MTXStrategy:
                     "券商持倉回應欄位漂移（schema drift），無法可靠判讀 net。\n"
                     "對帳已暫停（不誤報），請檢查 SDK / DPosition 欄位是否變動。"
                 )
+            self._sdk_read_timeout_streak += 1
+            if self._sdk_read_timeout_streak == SDK_READ_TIMEOUT_ALERT_N:
+                try:
+                    self._safe_health_notify(
+                        f"⚠️ broker position reads unavailable {self._sdk_read_timeout_streak}x in a row "
+                        f"(schema-drift or SDK timeout; recon skipped, loop kept alive)"
+                    )
+                except Exception:
+                    pass
             return
         # Good read — clear the schema-drift alert latch.
         self._recon_schema_alert_sent = False
+        self._sdk_read_timeout_streak = 0
 
         # Broker returns {productid, bs, qty} or None.
         if broker_pos is None:
