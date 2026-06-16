@@ -465,7 +465,9 @@ SDK_READ_TIMEOUT_SEC = float(os.getenv("SDK_READ_TIMEOUT_SEC", "5"))
 
 - [ ] **Step 2: Wrap `get_position` in `_query_broker_position`**
 
-In `trader.py`, change the SDK call (currently `resp = self.api.daccount.get_position(self.actno)`, ~:176) to:
+> **CORRECTION (recon safety):** on a position-read timeout this method must return **`SCHEMA_FAIL`**, NOT `None`. In `_check_broker_reconciliation`, `broker_pos is None` is treated as **"broker is flat" (`broker_net = 0`)** — a *successful* read — so a timeout→`None` would be misread as flat and could fire a **false `DAILY_RECON_ALERT`** when the bot actually holds a position (the 2026-05 phantom-alert bug). `SCHEMA_FAIL` is the method's existing "couldn't read a trustworthy position → skip this cycle" sentinel (`strategy.py:1102 if broker_pos is SCHEMA_FAIL: return`). A timeout is morally identical (the read is untrustworthy), so reuse it.
+
+In `trader.py`, wrap the SDK call (currently `resp = self.api.daccount.get_position(self.actno)`, ~:176) so a timeout returns `SCHEMA_FAIL` and is NOT swallowed by the method's broad `except Exception` (which returns `None`). Use a nested try:
 
 ```python
         try:
@@ -475,10 +477,10 @@ In `trader.py`, change the SDK call (currently `resp = self.api.daccount.get_pos
             )
         except SDKCallTimeout:
             logger.error(f"broker get_position timed out after {SDK_READ_TIMEOUT_SEC}s — skipping recon cycle")
-            return None
+            return SCHEMA_FAIL
 ```
 
-> NOTE: `None` is this method's existing "unavailable" return — confirm the real sentinel by reading `_query_broker_position` (it returns `None` / an empty/`unknown` shape on its existing error paths) and match it exactly so the caller's existing skip logic triggers unchanged. Do not invent a new return shape.
+> NOTE: confirm `SCHEMA_FAIL`'s exact name/location by reading `_query_broker_position` (it already `return SCHEMA_FAIL` on field drift, ~:190). Ensure the `except SDKCallTimeout` sits INSIDE the method but is reached before the broad `except Exception` would catch it (i.e., wrap just the `call_with_timeout` so SDKCallTimeout returns SCHEMA_FAIL, while genuine SDK errors still fall through to the existing `None` path).
 
 - [ ] **Step 3: Wrap `get_margin` in `_query_broker_margin_excess`**
 
@@ -511,27 +513,27 @@ In `__init__`, initialise the counter:
 self._sdk_read_timeout_streak = 0
 ```
 
-A broker read returning the unavailable sentinel within `_check_broker_reconciliation` already causes that cycle to skip. Add, at the point where recon detects the broker position is unavailable (the existing `broker_pos is None` / schema-drift skip branch ~strategy.py:1061-1070):
+Attach the counter to the existing `SCHEMA_FAIL` skip branch in `_check_broker_reconciliation` (`strategy.py:1102 if broker_pos is SCHEMA_FAIL: return`). INSIDE that branch, before its `return`, add the increment + alert:
 
 ```python
             self._sdk_read_timeout_streak += 1
             if self._sdk_read_timeout_streak == SDK_READ_TIMEOUT_ALERT_N:
                 try:
                     self._safe_health_notify(
-                        f"⚠️ broker reads unavailable {self._sdk_read_timeout_streak}x in a row "
-                        f"(SDK may be wedged; reads are timing out, loop kept alive)"
+                        f"⚠️ broker position reads unavailable {self._sdk_read_timeout_streak}x in a row "
+                        f"(schema-drift or SDK timeout; recon skipped, loop kept alive)"
                     )
                 except Exception:
                     pass
 ```
 
-And reset it on a successful broker read (where recon successfully obtains `broker_pos`):
+Reset the streak immediately AFTER the `SCHEMA_FAIL` guard — i.e. on any cycle where `broker_pos` is a usable reading (a real position OR `None`=flat both count as a successful read):
 
 ```python
             self._sdk_read_timeout_streak = 0
 ```
 
-> NOTE: place the increment on the unavailable/skip branch and the reset on the success branch of `_check_broker_reconciliation`. Read the method first to attach to the correct branches; do not duplicate the skip logic.
+> NOTE: the increment/alert goes INSIDE `if broker_pos is SCHEMA_FAIL:` (before its `return`); the reset goes on the line right after that guard (broker_pos usable). Read the method first to confirm the exact branch and indentation; do not duplicate the existing skip/return logic. (SCHEMA_FAIL now covers both schema-drift and read-timeout — the alert text is cause-agnostic accordingly.)
 
 - [ ] **Step 5: Verify imports/parse + full unit suite**
 

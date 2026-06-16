@@ -134,7 +134,7 @@ def call_with_timeout(fn, *args, timeout, **kwargs):
   resp = call_with_timeout(self.api.daccount.get_position, self.actno,
                            timeout=SDK_READ_TIMEOUT_SEC)   # default 5s, env-overridable
   ```
-  On `SDKCallTimeout`, the method returns its existing "unavailable" sentinel; the callers (`_check_broker_reconciliation` / `_check_margin_headroom`) already try/except and skip the cycle — both are ~1/min throttled safety nets, so skipping a cycle is benign.
+  On `SDKCallTimeout`, each method returns the sentinel its caller already treats as "skip this cycle": `_query_broker_position` returns **`SCHEMA_FAIL`** (NOT `None` — recon treats `broker_pos is None` as "broker flat", so a timeout→`None` could fire a false `DAILY_RECON_ALERT`; `SCHEMA_FAIL` hits the existing `strategy.py:1102` skip-without-alert branch), and `_query_broker_margin_excess` returns **`None`** (its caller `_check_margin_headroom` skips on `None`). Both are ~1/min throttled safety nets, so skipping a cycle is benign. A consecutive-`SCHEMA_FAIL` counter (schema-drift OR timeout) raises a health alert after `SDK_READ_TIMEOUT_ALERT_N` in a row.
 - **Consecutive-timeout counter:** after `K` consecutive timeouts (default 3), `_safe_health_notify("broker reads timing out Nx — SDK may be wedged")` for visibility *before* the freeze backstop. Counter resets on any successful read.
 - **Writes are NOT wrapped** in Phase 1 (Phase 2).
 
