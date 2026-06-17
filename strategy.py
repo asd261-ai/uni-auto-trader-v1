@@ -12,7 +12,7 @@ import heartbeat
 import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
-from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
+from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state, load_mtx_product, rolled_over
 from settlement_calendar import is_settlement_window
 from margin_headroom import headroom_low
 from session_timing import session_summary_action
@@ -448,34 +448,49 @@ class MTXStrategy:
                 # is the bug being fixed: those are lock-refused / HALF_SIZE-skipped
                 # units the bot never filled, so we must NOT restore them as positions.
                 local_units = load_mtx_state(str(MTX_STATE_PATH))
-                skip_restore = os.getenv("MTX_SKIP_RESTORE", "0") == "1"
-                if skip_restore:
+                stored_product = load_mtx_product(str(MTX_STATE_PATH))
+                current_product = self.trader.config.get("product")
+                # Skip in dry-run: there config["product"] is the static default (trader.start /
+                # _resolve_product never ran), so a rollover comparison would be spurious. Live only.
+                if not self.dry_run and rolled_over(stored_product, current_product):
+                    # Operator rolled UNITRADE_PRODUCT at settlement -> every local unit is on
+                    # the now-settled old contract. Drop them; do not restore the phantom. (#16)
+                    logger.info(
+                        f"Startup: settlement rollover detected — product {stored_product} -> "
+                        f"{current_product}; dropping {len(local_units)} unit(s) from the settled "
+                        f"contract (not restored)"
+                    )
                     self._last_seen_id["mtx"] = history[0]["id"]
-                    logger.info(f"Startup: MTX SKIP_RESTORE — flat boot, last id={self._last_seen_id['mtx']}")
+                    self._save_mtx_state()   # persist empty units + the new product
                 else:
-                    rec = reconcile_restore(local_units, history, cutoff_ms)
-                    mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
-                    for u in rec["to_restore"][:mtx_cap]:
-                        u = self._normalize(u, "mtx")
-                        # Local units store the signal label under "sig_label", and _normalize
-                        # blanks "label" (no Worker "sigLabel" present). Recover it so _open_unit
-                        # (reads "label") keeps the label on restore.
-                        u["label"] = u.get("label") or u.get("sig_label", "")
-                        logger.info(f"Startup: restoring MTX id={u['id']} dir={u['dir']} "
-                                    f"(local-confirmed, no order placed)")
-                        self._open_unit(u, source="mtx", notify=False, place_order=False)
-                    for unit, worker in rec["to_record_exit"]:
-                        self._record_missed_exit(unit, worker)
-                    for pid in rec["skipped_phantoms"]:
-                        logger.warning(f"Startup: SKIP phantom MTX id={pid} "
-                                       f"(Worker-open but bot never filled — not restored)")
-                    if rec["dropped_stale"]:
-                        logger.info(f"Startup: dropped {len(rec['dropped_stale'])} stale local MTX unit(s)")
-                    self._save_mtx_state()   # persist the reconciled set (drops recorded-exit + stale)
-                    self._last_seen_id["mtx"] = history[0]["id"]
-                    logger.info(f"Startup: MTX restored {len(self._units['mtx'])}, "
-                                f"recorded {len(rec['to_record_exit'])} missed-exit, "
-                                f"skipped {len(rec['skipped_phantoms'])} phantom")
+                    skip_restore = os.getenv("MTX_SKIP_RESTORE", "0") == "1"
+                    if skip_restore:
+                        self._last_seen_id["mtx"] = history[0]["id"]
+                        logger.info(f"Startup: MTX SKIP_RESTORE — flat boot, last id={self._last_seen_id['mtx']}")
+                    else:
+                        rec = reconcile_restore(local_units, history, cutoff_ms)
+                        mtx_cap = MAX_UNITS_PER_SOURCE["mtx"]
+                        for u in rec["to_restore"][:mtx_cap]:
+                            u = self._normalize(u, "mtx")
+                            # Local units store the signal label under "sig_label", and _normalize
+                            # blanks "label" (no Worker "sigLabel" present). Recover it so _open_unit
+                            # (reads "label") keeps the label on restore.
+                            u["label"] = u.get("label") or u.get("sig_label", "")
+                            logger.info(f"Startup: restoring MTX id={u['id']} dir={u['dir']} "
+                                        f"(local-confirmed, no order placed)")
+                            self._open_unit(u, source="mtx", notify=False, place_order=False)
+                        for unit, worker in rec["to_record_exit"]:
+                            self._record_missed_exit(unit, worker)
+                        for pid in rec["skipped_phantoms"]:
+                            logger.warning(f"Startup: SKIP phantom MTX id={pid} "
+                                           f"(Worker-open but bot never filled — not restored)")
+                        if rec["dropped_stale"]:
+                            logger.info(f"Startup: dropped {len(rec['dropped_stale'])} stale local MTX unit(s)")
+                        self._save_mtx_state()   # persist the reconciled set (drops recorded-exit + stale)
+                        self._last_seen_id["mtx"] = history[0]["id"]
+                        logger.info(f"Startup: MTX restored {len(self._units['mtx'])}, "
+                                    f"recorded {len(rec['to_record_exit'])} missed-exit, "
+                                    f"skipped {len(rec['skipped_phantoms'])} phantom")
         except Exception as e:
             logger.warning(f"Startup MTX fetch failed: {e}")
 
@@ -1009,7 +1024,8 @@ class MTXStrategy:
         """Atomic write of _units['mtx'] to disk — the bot's authoritative record of
         which MTX units it actually opened. Read at startup by the restore reconciler."""
         try:
-            save_mtx_state(str(MTX_STATE_PATH), self._units.get("mtx", []))
+            save_mtx_state(str(MTX_STATE_PATH), self._units.get("mtx", []),
+                           self.trader.config.get("product"))
         except Exception as e:
             logger.error(f"MTX state save failed: {e}")
 
