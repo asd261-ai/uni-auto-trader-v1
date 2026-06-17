@@ -64,7 +64,24 @@ class AutoTrader:
         viploginm rejects the near-month alias (e.g. MXFG5) with 商品代號錯誤; orders,
         quote subscription, and recon must use the actual contract prod_id. Picks the
         nearest (smallest-month) listed contract so rollover is automatic. Fails loud
-        rather than trade a code the broker will reject."""
+        rather than trade a code the broker will reject.
+
+        UNITRADE_PRODUCT (if set) FORCES the contract and skips broker min-month
+        resolution. Needed at settlement rollover: the broker keeps listing the
+        just-settled month, so min-month would wrongly pick the EXPIRED contract
+        (2026-06-17 night kill-loop on settled MXFF6). Operator sets it to the
+        correct contract (e.g. MXFG6 after June settlement); clear it to restore
+        auto-resolve. Resolved before the broker query so it works even if the
+        contract API is flaky."""
+        override = os.getenv("UNITRADE_PRODUCT", "").strip()
+        if override:
+            old = self.config.get("product")
+            self.config["product"] = override
+            logger.info(
+                f"Product OVERRIDE via UNITRADE_PRODUCT={override} (was={old}) "
+                f"— skipping broker min-month resolve"
+            )
+            return
         base = os.getenv("UNITRADE_PRODUCT_BASE") or self.config["product"][:3]
         resp = self.api.get_domestic_contracts(base, "F")
         if not getattr(resp, "ok", False):
