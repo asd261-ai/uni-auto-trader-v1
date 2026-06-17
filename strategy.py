@@ -13,6 +13,7 @@ import trade_log_emit
 import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state
+from settlement_calendar import is_settlement_window
 from margin_headroom import headroom_low
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
@@ -196,6 +197,21 @@ POLLLOOP_FREEZE_KILL      = os.getenv("POLLLOOP_FREEZE_KILL", "off").lower() == 
 # as SCHEMA_FAIL from _query_broker_position) streak before a Health-bot alert.
 SDK_READ_TIMEOUT_ALERT_N  = int(os.getenv("SDK_READ_TIMEOUT_ALERT_N", "3"))
 
+# Settlement-day awareness: on the 3rd Wednesday the front contract settles at 13:30,
+# so 13:30-15:00 has no ticks and any held position is gone. _get_session returns
+# "break" then (tick-watchdog skips, trading halts). Optional override for holiday-
+# shifted settlements: MTX_SETTLEMENT_OVERRIDE_DATE=YYYY-MM-DD.
+def _parse_settlement_override(raw):
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        logger.warning(f"Ignoring unparseable MTX_SETTLEMENT_OVERRIDE_DATE={raw!r} (want YYYY-MM-DD)")
+        return None
+
+_SETTLEMENT_OVERRIDE_DATE = _parse_settlement_override(os.getenv("MTX_SETTLEMENT_OVERRIDE_DATE"))
+
 ENTRY_EMOJI = {"long": "🟢", "short": "🔴"}
 EXIT_EMOJI  = {"profit": "✅", "loss": "❌", "reversed": "🔄", "replaced": "🔁", "trail": "🔒",
                "session_end": "🌙"}
@@ -203,6 +219,11 @@ SOURCE_TAG  = {"mtx": "[MTX] ", "fvg": "[FVG] "}  # Both sources tagged for Tele
 
 
 def _get_session(dt: datetime) -> str:
+    # Settlement day 13:30-15:00: front contract has settled, treat as break so the
+    # tick-watchdog doesn't false-kill on the no-tick feed and the bot stops trading
+    # the settled contract. Relies on caller passing TW-local (TZ_TW) datetime.
+    if is_settlement_window(dt, _SETTLEMENT_OVERRIDE_DATE):
+        return "break"
     # Weekday-aware (2026-06-09): the night session runs 15:00 day D -> 05:00 day D+1
     # for trading days D in Mon-Fri, so the early-morning leg (t < 05:00) is only a
     # real session on Tue-Sat. Without this, Monday 00:00-05:00 was mislabeled "night"
