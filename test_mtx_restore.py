@@ -7,6 +7,9 @@ import tempfile
 import unittest
 
 import mtx_restore as mr
+from mtx_restore import (
+    load_mtx_state, save_mtx_state, load_mtx_product, rolled_over,
+)
 
 
 class StateRoundTripTest(unittest.TestCase):
@@ -102,3 +105,68 @@ class ReconcileRestoreTest(unittest.TestCase):
         )
         self.assertEqual(rec["to_restore"], [])
         self.assertEqual(rec["dropped_stale"], [500])
+
+
+class RolledOverTests(unittest.TestCase):
+    def test_changed_product_is_rollover(self):
+        self.assertTrue(rolled_over("MXFG6", "MXFH6"))
+
+    def test_same_product_is_not_rollover(self):
+        self.assertFalse(rolled_over("MXFG6", "MXFG6"))
+
+    def test_missing_stored_product_is_not_rollover(self):
+        # legacy file (no product key) or first boot -> conservative, never drop
+        self.assertFalse(rolled_over(None, "MXFG6"))
+
+    def test_missing_current_product_is_not_rollover(self):
+        self.assertFalse(rolled_over("MXFG6", None))
+
+    def test_whitespace_stripped_no_false_rollover(self):
+        # a stray space in the env-sourced product must NOT drop a live position
+        self.assertFalse(rolled_over("MXFG6", " MXFG6"))
+        self.assertFalse(rolled_over(" MXFG6 ", "MXFG6"))
+
+    def test_whitespace_real_rollover_still_detected(self):
+        self.assertTrue(rolled_over(" MXFG6 ", "MXFH6"))
+
+    def test_whitespace_only_current_is_not_a_product(self):
+        self.assertFalse(rolled_over("MXFG6", "   "))  # whitespace-only -> falsy after strip
+
+
+class ProductPersistenceTests(unittest.TestCase):
+    def _tmp(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def test_save_then_load_product(self):
+        path = self._tmp()
+        save_mtx_state(path, [{"id": 1, "dir": "long"}], product="MXFG6")
+        self.assertEqual(load_mtx_product(path), "MXFG6")
+        self.assertEqual(load_mtx_state(path), [{"id": 1, "dir": "long"}])
+
+    def test_save_without_product_writes_none(self):
+        path = self._tmp()
+        save_mtx_state(path, [])  # product defaults to None
+        self.assertIsNone(load_mtx_product(path))
+
+    def test_load_product_legacy_file_without_key(self):
+        path = self._tmp()
+        with open(path, "w") as f:
+            json.dump({"mtx_units": [{"id": 1}]}, f)   # no "product" key
+        self.assertIsNone(load_mtx_product(path))
+        self.assertEqual(load_mtx_state(path), [{"id": 1}])  # units still load
+
+    def test_load_product_missing_file(self):
+        self.assertIsNone(load_mtx_product("/nonexistent/path/x.json"))
+
+    def test_load_product_corrupt_json(self):
+        path = self._tmp()
+        with open(path, "w") as f:
+            f.write("{not json")
+        self.assertIsNone(load_mtx_product(path))
+
+
+if __name__ == "__main__":
+    unittest.main()

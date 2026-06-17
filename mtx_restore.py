@@ -28,12 +28,37 @@ def load_mtx_state(path):
     return units if isinstance(units, list) else []
 
 
-def save_mtx_state(path, units):
-    """Atomic write of the MTX units list (tmp + os.replace)."""
+def load_mtx_product(path):
+    """Return the persisted active product code, or None if missing/corrupt/absent."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    prod = data.get("product")
+    return prod if isinstance(prod, str) and prod else None
+
+
+def save_mtx_state(path, units, product=None):
+    """Atomic write of the MTX units list + active product (tmp + os.replace)."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"mtx_units": list(units)}, f, ensure_ascii=False)
+        json.dump({"product": product, "mtx_units": list(units)}, f, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def rolled_over(stored_product, current_product):
+    """True iff the contract rolled since the last save (= settlement rollover).
+
+    Only fires when BOTH are known and differ — a missing stored product (legacy file
+    or first boot) is conservative and never triggers a drop. Whitespace is stripped so a
+    stray space in the env-sourced product never causes a false drop of a live position.
+    """
+    s = stored_product.strip() if isinstance(stored_product, str) else stored_product
+    c = current_product.strip() if isinstance(current_product, str) else current_product
+    return bool(s) and bool(c) and s != c
 
 
 def _worker_by_id(worker_history):
