@@ -1,12 +1,16 @@
-"""READ-ONLY reconciliation: trades.jsonl `pnl_pts_real` vs orders.jsonl FIFO ground truth.
+"""READ-ONLY diagnostic: trades.jsonl `pnl_pts_real` vs orders.jsonl whole-history FIFO.
 
-Monday observe-first tool for task B (trades.jsonl real-fill P&L, DEPLOYED 2026-06-06).
-Verifies the new per-trade real-fill field agrees with the AUTHORITATIVE orders.jsonl FIFO.
+⚠️ CANONICAL INVERTED (2026-06-18). Built 2026-06-06 believing the orders.jsonl FIFO was
+AUTHORITATIVE and `pnl_pts_real` the suspect. The 2026-06-18 investigation proved the
+OPPOSITE: the whole-history orders FIFO is the broken one — no boot/session floor lets a
+stale unmatched leg (e.g. 6/12 L@43946) mis-pair today's first close (the +2176/+322 bug),
+and on the shared account it cross-pairs Sean's manual same-month trades. `pnl_pts_real`
+(each trade self-paired at its own entry/exit fill) is now CANONICAL for live P&L. A
+divergence flagged here therefore means the orders-FIFO side is contaminated, NOT that
+pnl_pts_real is wrong. Kept only as a contamination detector.
 
-Rule [[feedback-real-pnl-orders-not-trades-jsonl]]: orders.jsonl真實成交 FIFO is canonical;
-trades.jsonl `pnl_pts` is signal-based and systematically UNDER-reports (6/5: signal −91 vs
-real −325). The new `pnl_pts_real` column is supposed to close that gap by stamping broker
-Match prices onto each row — this tool checks it actually does, the first real trading day.
+Note: the old caution in [[feedback-real-pnl-orders-not-trades-jsonl]] is about trades.jsonl
+`pnl_pts` (the SIGNAL field, which does under-report) — NOT `pnl_pts_real` (real fills).
 
 Pure math (reconcile / day_window) is I/O-free and unit-tested. The CLI does the file reads,
 reusing pnl_calc's FIFO so we never fork a second, divergent FIFO implementation.
