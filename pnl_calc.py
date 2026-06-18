@@ -327,7 +327,8 @@ def heartbeat_fields(base: str = "MXF") -> dict:
                              "real_trading_day_trades": None,
                              "real_month_pnl_pts": None,
                              "real_open": "err",
-                             "real_day_missing_fill": None}
+                             "real_day_missing_fill": None,
+                             "real_day_pnl_pertrade": None}
         _CACHE["ts"] = now
         _CACHE["day"] = day
     return _CACHE["val"]
