@@ -10,11 +10,19 @@ shared-account trades. These tests pin the correct behaviour.
 import unittest
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from pnl_calc import summarize_real_pnl, _parse_iso, _trading_day_window
+from pnl_calc import summarize_real_pnl, _parse_iso, _trading_day_window, bot_ordernos
 
 
 def rec(trading_day, real, signal=0.0, source="mtx"):
     return {"trading_day": trading_day, "pnl_pts_real": real, "pnl_pts": signal, "source": source}
+
+
+def _sent(ts, pid="MXFG6", bs="B"):
+    return {"ts": ts, "event": "sent", "productid": pid, "bs": bs}
+
+
+def _reply(ts, ono, pid="MXFG6", bs="B"):
+    return {"ts": ts, "event": "reply", "productid": pid, "bs": bs, "orderno": ono}
 
 
 class SummarizeRealPnlTest(unittest.TestCase):
@@ -81,6 +89,35 @@ class TimeHelpersTest(unittest.TestCase):
         start, end = _trading_day_window("2026-06-18")
         night = _parse_iso("2026-06-19T02:52:40+08:00")
         self.assertTrue(start <= night < end)
+
+
+class BotOrdernosTest(unittest.TestCase):
+    def test_sent_backed_reply_is_bot(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00"),
+                _reply("2026-06-18T10:00:00+08:00", "QN001")]
+        self.assertEqual(bot_ordernos(rows), {"QN001"})
+
+    def test_orphan_reply_no_sent_is_manual(self):
+        # Sean's manual MXFH6 fill: a reply/match with no preceding bot 'sent'.
+        rows = [_reply("2026-06-18T10:00:00+08:00", "QN999", pid="MXFH6")]
+        self.assertEqual(bot_ordernos(rows), set())
+
+    def test_two_sents_same_second_claim_distinct_replies(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00"),
+                _sent("2026-06-18T10:00:00+08:00"),
+                _reply("2026-06-18T10:00:00+08:00", "QN001"),
+                _reply("2026-06-18T10:00:00+08:00", "QN002")]
+        self.assertEqual(bot_ordernos(rows), {"QN001", "QN002"})
+
+    def test_reply_outside_3s_window_not_matched(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00"),
+                _reply("2026-06-18T10:00:10+08:00", "QN001")]  # 10s later
+        self.assertEqual(bot_ordernos(rows), set())
+
+    def test_different_product_not_matched(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00", pid="MXFG6"),
+                _reply("2026-06-18T10:00:00+08:00", "QN001", pid="MXFH6")]
+        self.assertEqual(bot_ordernos(rows), set())
 
 
 if __name__ == "__main__":

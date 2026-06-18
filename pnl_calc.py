@@ -42,6 +42,39 @@ def _trading_day_window(td):
     return start, start + timedelta(days=1)
 
 
+_LINK_WINDOW_SEC = 3  # max gap from a bot 'sent' to its 'reply' (real data: same second)
+
+
+def bot_ordernos(rows):
+    """Set of ordernos the bot actually sent. A 'sent' event carries no orderno;
+    it is paired to the first unclaimed 'reply' (which has the orderno) within
+    _LINK_WINDOW_SEC seconds sharing productid + bs. Manual/non-bot fills have no
+    'sent' and are therefore excluded. See provenance design 2026-06-19."""
+    sents, replies = [], []
+    for r in rows:
+        ev = r.get("event")
+        ts = _parse_iso(r.get("ts"))
+        if ts is None:
+            continue
+        if ev == "sent":
+            sents.append((ts, r.get("productid"), r.get("bs")))
+        elif ev == "reply" and r.get("orderno"):
+            replies.append((ts, r.get("productid"), r.get("bs"), r.get("orderno")))
+    sents.sort(key=lambda x: x[0])
+    replies.sort(key=lambda x: x[0])
+    claimed = set()
+    bot = set()
+    for sts, spid, sbs in sents:
+        for i, (rts, rpid, rbs, ono) in enumerate(replies):
+            if i in claimed:
+                continue
+            if rpid == spid and rbs == sbs and 0 <= (rts - sts).total_seconds() <= _LINK_WINDOW_SEC:
+                bot.add(ono)
+                claimed.add(i)
+                break
+    return bot
+
+
 _TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.jsonl")
 _STATE_PATH = os.path.join(os.path.dirname(__file__), "mtx_state.json")
 _CACHE = {"ts": 0.0, "val": None, "day": None}
