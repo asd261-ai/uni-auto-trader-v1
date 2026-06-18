@@ -179,6 +179,37 @@ def _fifo(fills):
     return closed, pos
 
 
+def realized_day_pts(rows, start, end):
+    """(realized_points, round_trips) from bot match fills inside [start, end),
+    FIFO'd per EXACT contract. Provenance (bot_ordernos) drops manual/non-bot
+    fills; the window drops stale prior-day legs; per-product grouping prevents
+    cross-contract pairing on a settlement-day rollover. Open legs stay open
+    (unrealized, not counted)."""
+    bot = bot_ordernos(rows)
+    by_pid = {}
+    for r in rows:
+        if r.get("event") != "match" or r.get("orderno") not in bot:
+            continue
+        ts = _parse_iso(r.get("ts"))
+        if ts is None or not (start <= ts < end):
+            continue
+        bs = r.get("bs")
+        price = r.get("matchprice")
+        if bs not in ("B", "S") or price is None:
+            continue
+        qty = int(r.get("matchqty") or 1)
+        for _ in range(max(1, qty)):
+            by_pid.setdefault(r.get("productid"), []).append((ts, bs, float(price)))
+    total = 0.0
+    trips = 0
+    for fills in by_pid.values():
+        fills.sort(key=lambda x: x[0])
+        closed, _open = _fifo(fills)
+        total += sum(pnl for _ts, pnl in closed)
+        trips += len(closed)
+    return round(total, 1), trips
+
+
 def _read_trades():
     out = []
     if not os.path.exists(_TRADES_PATH):

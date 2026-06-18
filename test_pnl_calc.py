@@ -120,5 +120,85 @@ class BotOrdernosTest(unittest.TestCase):
         self.assertEqual(bot_ordernos(rows), set())
 
 
+from pnl_calc import realized_day_pts
+
+
+def _match(ts, ono, bs, price, pid="MXFG6", qty=1):
+    return {"ts": ts, "event": "match", "productid": pid, "bs": bs,
+            "orderno": ono, "matchprice": price, "matchqty": qty}
+
+
+class RealizedDayPtsTest(unittest.TestCase):
+    def setUp(self):
+        self.start, self.end = _trading_day_window("2026-06-18")
+
+    def _long_roundtrip(self, t1, t2, ono_in, ono_out, ein, eout):
+        # bot long: sent+reply open (B), sent+reply close (S)
+        return [_sent(t1, bs="B"), _reply(t1, ono_in, bs="B"),
+                _match(t1, ono_in, "B", ein),
+                _sent(t2, bs="S"), _reply(t2, ono_out, bs="S"),
+                _match(t2, ono_out, "S", eout)]
+
+    def test_bot_only_roundtrip_realizes_correctly(self):
+        rows = self._long_roundtrip("2026-06-18T10:00:00+08:00",
+                                    "2026-06-18T10:10:00+08:00",
+                                    "QN1", "QN2", 46430.0, 46508.0)
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 78.0)   # long: 46508 - 46430
+        self.assertEqual(trips, 1)
+
+    def test_manual_fill_no_sent_excluded(self):
+        rows = self._long_roundtrip("2026-06-18T10:00:00+08:00",
+                                    "2026-06-18T10:10:00+08:00",
+                                    "QN1", "QN2", 46430.0, 46508.0)
+        # Sean's manual MXFH6 round-trip: match events with NO sent backing them.
+        rows += [_match("2026-06-18T11:00:00+08:00", "M1", "S", 50000.0, pid="MXFH6"),
+                 _match("2026-06-18T11:05:00+08:00", "M2", "B", 49000.0, pid="MXFH6")]
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 78.0)   # manual MXFH6 ignored
+        self.assertEqual(trips, 1)
+
+    def test_two_products_fifo_independently_no_cross_pair(self):
+        # settlement-day style: bot fills on old + new contract; each FIFOs alone.
+        rows = self._long_roundtrip("2026-06-18T10:00:00+08:00",
+                                    "2026-06-18T10:10:00+08:00",
+                                    "QN1", "QN2", 46430.0, 46508.0)  # MXFG6 +78
+        g = [_sent("2026-06-18T11:00:00+08:00", pid="MXFH6", bs="S"),
+             _reply("2026-06-18T11:00:00+08:00", "QN3", pid="MXFH6", bs="S"),
+             _match("2026-06-18T11:00:00+08:00", "QN3", "S", 47000.0, pid="MXFH6"),
+             _sent("2026-06-18T11:10:00+08:00", pid="MXFH6", bs="B"),
+             _reply("2026-06-18T11:10:00+08:00", "QN4", pid="MXFH6", bs="B"),
+             _match("2026-06-18T11:10:00+08:00", "QN4", "B", 46980.0, pid="MXFH6")]  # short +20
+        pts, trips = realized_day_pts(rows + g, self.start, self.end)
+        self.assertEqual(pts, 98.0)   # 78 (MXFG6 long) + 20 (MXFH6 short), no cross-pair
+        self.assertEqual(trips, 2)
+
+    def test_null_pnl_pts_real_trade_still_captured(self):
+        # The +170-vs-+167 case: a trade whose exit_fill was never stamped (so
+        # trades.jsonl pnl_pts_real is None) STILL has real match fills here.
+        rows = self._long_roundtrip("2026-06-19T03:00:00+08:00",
+                                    "2026-06-19T03:05:00+08:00",
+                                    "QN1", "QN2", 47545.0, 47480.0)  # long: 47480-47545 = -65
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, -65.0)
+        self.assertEqual(trips, 1)
+
+    def test_stale_leg_before_window_excluded(self):
+        # An unmatched bot leg dated before the window must not pair with today's
+        # close (the +2176 regression). Only the in-window open should remain open.
+        rows = [_sent("2026-06-12T10:00:00+08:00", bs="B"),
+                _reply("2026-06-12T10:00:00+08:00", "OLD", bs="B"),
+                _match("2026-06-12T10:00:00+08:00", "OLD", "B", 43946.0),  # 6/12 stale
+                _sent("2026-06-18T10:00:00+08:00", bs="S"),
+                _reply("2026-06-18T10:00:00+08:00", "QN2", bs="S"),
+                _match("2026-06-18T10:00:00+08:00", "QN2", "S", 46508.0)]  # today close
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 0.0)   # stale 6/12 leg out of window; today's lone S stays open
+        self.assertEqual(trips, 0)
+
+    def test_empty_is_flat_zero(self):
+        self.assertEqual(realized_day_pts([], self.start, self.end), (0.0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
