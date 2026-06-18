@@ -222,5 +222,36 @@ class DivergenceWarnTest(unittest.TestCase):
         self.assertFalse(divergence_warn(None, 167.0, 0))
 
 
+import os, tempfile
+import pnl_calc as pc
+
+
+class ComputeWiringTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _write(self, name, lines):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w", encoding="utf-8") as f:
+            for l in lines:
+                f.write(l + "\n")
+        return p
+
+    def test_read_orders_raw_missing_file_raises(self):
+        # _read_orders_raw on a non-existent path raises -> _compute maps to None.
+        with self.assertRaises(Exception):
+            pc._read_orders_raw(os.path.join(self.tmp, "nope.jsonl"))
+
+    def test_read_orders_raw_skips_bad_lines(self):
+        p = self._write("orders.jsonl",
+                        ['{"event":"match","orderno":"Q1"}', 'GARBAGE', '{"event":"sent"}'])
+        rows = pc._read_orders_raw(p)
+        self.assertEqual(len(rows), 2)   # garbage skipped
+
+    def test_read_orders_raw_empty_file_is_empty_list(self):
+        p = self._write("orders.jsonl", [])
+        self.assertEqual(pc._read_orders_raw(p), [])
+
+
 if __name__ == "__main__":
     unittest.main()

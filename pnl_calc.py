@@ -14,10 +14,13 @@ Additive:不碰下單流程、不碰訊號版計數。Restart-safe:trades.jsonl 
 快取 ~30s,並以 08:45 交易日窗為 key(日界一過即失效,避免熔斷讀到昨日全日 P&L)。
 """
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
+
+_log = logging.getLogger("pnl_calc")
 
 _TZ = ZoneInfo("Asia/Taipei")
 
@@ -210,6 +213,23 @@ def realized_day_pts(rows, start, end):
     return round(total, 1), trips
 
 
+def _read_orders_raw(path=None):
+    """Parsed orders.jsonl rows (bad JSON lines skipped). Raises if the file is
+    absent/unreadable so _compute can fail-open to None. An empty file -> []."""
+    p = path or os.path.join(os.path.dirname(__file__), "orders.jsonl")
+    out = []
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
 def _read_trades():
     out = []
     if not os.path.exists(_TRADES_PATH):
@@ -250,9 +270,25 @@ def _real_open() -> str:
 
 
 def _compute(base=None):
-    out = summarize_real_pnl(_read_trades(), _today_trading_day())
-    out["real_open"] = _real_open()
-    return out
+    td = _today_trading_day()
+    xcheck = summarize_real_pnl(_read_trades(), td)   # per-trade sum + month + missing
+    start, end = _trading_day_window(td)
+    try:
+        day_pnl, day_trades = realized_day_pts(_read_orders_raw(), start, end)
+    except Exception:
+        day_pnl, day_trades = None, None              # fail-open: breaker sees no-data
+    if divergence_warn(day_pnl, xcheck["real_trading_day_pnl_pts"],
+                       xcheck["real_day_missing_fill"]):
+        _log.warning("PNL_DIVERGENCE: orders-FIFO=%s vs per-trade=%s (missing_fill=0) "
+                     "— check provenance/data", day_pnl, xcheck["real_trading_day_pnl_pts"])
+    return {
+        "real_trading_day_pnl_pts": day_pnl,                              # FIFO -> breaker
+        "real_trading_day_trades":  day_trades,
+        "real_month_pnl_pts":       xcheck["real_month_pnl_pts"],         # display (per-trade)
+        "real_day_missing_fill":    xcheck["real_day_missing_fill"],
+        "real_day_pnl_pertrade":    xcheck["real_trading_day_pnl_pts"],   # visibility
+        "real_open":                _real_open(),
+    }
 
 
 _DIVERGENCE_TOL_PTS = 1.0
