@@ -90,6 +90,18 @@ class TimeHelpersTest(unittest.TestCase):
         night = _parse_iso("2026-06-19T02:52:40+08:00")
         self.assertTrue(start <= night < end)
 
+    def test_window_lower_boundary_is_start(self):
+        # 08:45:00 sharp is the inclusive lower edge of the window.
+        start, end = _trading_day_window("2026-06-18")
+        self.assertEqual(start, _parse_iso("2026-06-18T08:45:00+08:00"))
+
+    def test_consecutive_windows_have_no_gap(self):
+        # end of one trading day == start of the next: half-open [start,end) tiling,
+        # no 1-second hole that could drop a fill for the fuse.
+        _, end_prev = _trading_day_window("2026-06-17")
+        start_next, _ = _trading_day_window("2026-06-18")
+        self.assertEqual(end_prev, start_next)
+
 
 class BotOrdernosTest(unittest.TestCase):
     def test_sent_backed_reply_is_bot(self):

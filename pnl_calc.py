@@ -1,17 +1,26 @@
-"""READ-ONLY 真實成交 P&L,從 trades.jsonl 每筆自己的 pnl_pts_real 加總算出。
+"""READ-ONLY 真實成交 P&L — 當日已實現損益以「逐精確商品 FIFO」計算,為心跳 + 每日最大虧損熔斷的 AUTHORITATIVE 來源。
 
-2026-06-18 修正(原本 FIFO orders.jsonl 全歷史的做法有兩個 bug):
-  1. 無 boot/session floor → 今日第一筆平倉被配到 5 天前的陳舊未平腿
-     (例:6/12 L@43946),把單筆灌成 +2176,後續整列錯位一格(報 +322,
-     真實 −47/−54)。
-  2. 共用帳號:當 bot 與 Sean 手動單在同一個月份合約(都 MXFG6)時,
-     contract-base 過濾擋不掉手動單 → 污染 bot P&L / 熔斷輸入。
-改用 trades.jsonl 的 pnl_pts_real(real_fill_pnl 在每筆進/出場時各自記下的成交價配對):
-  • bot-only by construction — trades.jsonl 只記 bot 自己的交易,手動單永遠不在裡面;
-  • 每筆配自己的腿 → 免疫陳舊腿 / 跨歷史 FIFO 污染;
-  • pnl_pts_real 為 None(紙上單 or 缺 fill)者排除、不灌水、另計數。
-Additive:不碰下單流程、不碰訊號版計數。Restart-safe:trades.jsonl 持久且開機還原。
-快取 ~30s,並以 08:45 交易日窗為 key(日界一過即失效,避免熔斷讀到昨日全日 P&L)。
+【設計重點:Provenance-FIFO,2026-06-19】
+計算方式:讀取 orders.jsonl,按精確 productid(如 MXFG6)各自 FIFO 配對平倉。
+僅納入 bot 自身成交,透過 sent→reply(orderno)→match 事件鏈(bot_ordernos)追溯來源,
+確保 manual/非 bot 單結構性排除。原因:共用帳號下 bot 下 MXFG6、Sean 手動下 MXFH6 等不同月份
+合約,兩者無 `sent` 事件關聯,故天然隔離,不污染 bot P&L 或熔斷輸入。
+窗口 floor = 當日 08:45 TW,阻擋跨日陳舊腿(解決 +2176/+322 誤配 bug)。
+逐商品 FIFO 確保結算換倉日新舊合約不互相配對。
+FIFO realized 值為主要輸出(realized_day_pts),喂入 heartbeat realPnl 及 DAILY_MAX_LOSS 熔斷。
+
+【平行交叉驗證】
+trades.jsonl 的 per-trade pnl_pts_real 加總仍保留為副線(summarize_real_pnl),
+提供 real_month_pnl_pts + real_day_missing_fill。
+divergence_warn() 在兩者差異且無缺 fill 時記 WARNING,協助早期偵測數據異常。
+
+【Fail-open 設計】
+orders.jsonl 無法讀取時回傳 None → 熔斷視為無資料,不鎖倉、不憑空生成數字。
+
+【快取】
+~30s 快取,以 08:45 交易日窗為 key;日界一過即失效,避免熔斷讀到前日累計 P&L。
+
+設計文件:docs/superpowers/specs/2026-06-19-pnl-provenance-fifo-design.md
 """
 import json
 import logging
