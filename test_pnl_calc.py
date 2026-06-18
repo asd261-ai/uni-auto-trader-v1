@@ -200,5 +200,27 @@ class RealizedDayPtsTest(unittest.TestCase):
         self.assertEqual(realized_day_pts([], self.start, self.end), (0.0, 0))
 
 
+from pnl_calc import divergence_warn
+
+
+class DivergenceWarnTest(unittest.TestCase):
+    def test_agree_no_warn(self):
+        self.assertFalse(divergence_warn(170.0, 170.0, 0))
+
+    def test_disagree_with_missing_fills_no_warn(self):
+        # +170 FIFO vs +167 per-trade is EXPECTED when 3 exits were unstamped.
+        self.assertFalse(divergence_warn(170.0, 167.0, 3))
+
+    def test_disagree_zero_missing_warns(self):
+        # disagreement with nothing missing => provenance/data problem.
+        self.assertTrue(divergence_warn(170.0, 150.0, 0))
+
+    def test_within_tolerance_no_warn(self):
+        self.assertFalse(divergence_warn(170.0, 169.5, 0))
+
+    def test_none_fifo_no_warn(self):
+        self.assertFalse(divergence_warn(None, 167.0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

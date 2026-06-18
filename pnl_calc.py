@@ -255,6 +255,21 @@ def _compute(base=None):
     return out
 
 
+_DIVERGENCE_TOL_PTS = 1.0
+
+
+def divergence_warn(fifo_pts, pertrade_pts, missing_fill):
+    """True when the authoritative orders-FIFO value and the per-trade pnl_pts_real
+    sum disagree by more than _DIVERGENCE_TOL_PTS with ZERO missing fills — a
+    disagreement not explained by unstamped exits, so a provenance/data smell worth
+    a log line. Never blocks the breaker."""
+    if fifo_pts is None or pertrade_pts is None:
+        return False
+    if missing_fill != 0:
+        return False
+    return abs(fifo_pts - pertrade_pts) > _DIVERGENCE_TOL_PTS
+
+
 def heartbeat_fields(base: str = "MXF") -> dict:
     """Cached real-fill P&L fields for the heartbeat payload. Never raises.
 
