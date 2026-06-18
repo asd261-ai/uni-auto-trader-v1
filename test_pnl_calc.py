@@ -8,7 +8,9 @@ history — which mis-paired today's first close against a stale 5-day-old leg
 shared-account trades. These tests pin the correct behaviour.
 """
 import unittest
-from pnl_calc import summarize_real_pnl
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from pnl_calc import summarize_real_pnl, _parse_iso, _trading_day_window
 
 
 def rec(trading_day, real, signal=0.0, source="mtx"):
@@ -56,6 +58,29 @@ class SummarizeRealPnlTest(unittest.TestCase):
         self.assertEqual(out["real_trading_day_trades"], 0)
         self.assertEqual(out["real_month_pnl_pts"], 0)
         self.assertEqual(out["real_day_missing_fill"], 0)
+
+
+class TimeHelpersTest(unittest.TestCase):
+    def test_parse_iso_with_offset(self):
+        dt = _parse_iso("2026-06-19T02:52:40+08:00")
+        self.assertEqual(dt, datetime(2026, 6, 19, 2, 52, 40,
+                                      tzinfo=timezone(timedelta(hours=8))))
+
+    def test_parse_iso_bad_returns_none(self):
+        self.assertIsNone(_parse_iso("not-a-timestamp"))
+        self.assertIsNone(_parse_iso(None))
+
+    def test_trading_day_window_spans_0845_to_0845(self):
+        start, end = _trading_day_window("2026-06-18")
+        tz = ZoneInfo("Asia/Taipei")
+        self.assertEqual(start, datetime(2026, 6, 18, 8, 45, tzinfo=tz))
+        self.assertEqual(end,   datetime(2026, 6, 19, 8, 45, tzinfo=tz))
+
+    def test_window_includes_after_midnight_night_fill(self):
+        # a night-session fill at 02:52 on 6/19 belongs to trading-day 6/18
+        start, end = _trading_day_window("2026-06-18")
+        night = _parse_iso("2026-06-19T02:52:40+08:00")
+        self.assertTrue(start <= night < end)
 
 
 if __name__ == "__main__":

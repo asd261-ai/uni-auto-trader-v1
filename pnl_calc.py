@@ -20,6 +20,28 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 _TZ = ZoneInfo("Asia/Taipei")
+
+
+def _parse_iso(ts):
+    """Parse an ISO-8601 string (e.g. '2026-06-19T02:52:40+08:00') to an aware
+    datetime. Returns None on any malformed / non-string input."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def _trading_day_window(td):
+    """[start, end) aware-datetime bounds for a trading day's 08:45 TW window.
+    A day labelled 2026-06-18 spans 2026-06-18 08:45 → 2026-06-19 08:45, so a
+    night-session round-trip closing after midnight still falls inside."""
+    d = datetime.strptime(td, "%Y-%m-%d").date()
+    start = datetime.combine(d, dtime(8, 45), _TZ)
+    return start, start + timedelta(days=1)
+
+
 _TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.jsonl")
 _STATE_PATH = os.path.join(os.path.dirname(__file__), "mtx_state.json")
 _CACHE = {"ts": 0.0, "val": None, "day": None}
