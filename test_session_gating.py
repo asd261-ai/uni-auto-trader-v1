@@ -64,6 +64,42 @@ class GetSessionTest(unittest.TestCase):
         self.assertEqual(_get_session(dt(TUE, 5, 0)), "break")
 
 
+class HolidaySessionGatingTest(unittest.TestCase):
+    """2026-06-18 holiday gate. 端午 6/19/2026 is a Fri (weekday) market holiday;
+    the weekday-only gate wrongly called it 'day'/'night'. Eve (6/18 Thu) night
+    session runs to 6/19 05:00 per TAIFEX, so the holiday DAWN tail stays active."""
+
+    def test_holiday_day_session_is_break(self):
+        # 端午 6/19 (Fri) 10:00 — was "day" under weekday-only gate, now break.
+        self.assertEqual(_get_session(datetime(2026, 6, 19, 10, 0)), "break")
+
+    def test_holiday_night_start_is_break(self):
+        # 6/19 (Fri) 20:00 — holiday evening, no night session opens.
+        self.assertEqual(_get_session(datetime(2026, 6, 19, 20, 0)), "break")
+
+    def test_holiday_dawn_tail_is_active(self):
+        # 6/19 (Fri) 02:00 — continuation of 6/18 (Thu, trading) night session,
+        # which TAIFEX runs to 6/19 05:00. Must stay "night" (feed live -> breaker protective).
+        self.assertEqual(_get_session(datetime(2026, 6, 19, 2, 0)), "night")
+        self.assertEqual(_get_session(datetime(2026, 6, 19, 4, 59)), "night")
+        self.assertEqual(_get_session(datetime(2026, 6, 19, 5, 0)), "break")
+
+    def test_eve_of_holiday_night_start_runs(self):
+        # 6/18 (Thu, trading) 20:00 — night opens, runs into holiday dawn. Active.
+        self.assertEqual(_get_session(datetime(2026, 6, 18, 20, 0)), "night")
+
+    def test_post_holiday_reopen(self):
+        # 6/22 (Mon) — market reopens after the 端午 long weekend.
+        self.assertEqual(_get_session(datetime(2026, 6, 22, 10, 0)), "day")
+
+    def test_consecutive_holiday_dawn_is_break(self):
+        # 春節: 2/16 (Mon) 除夕 + 2/17 (Tue) 初一 both holidays. 2/17 dawn tail would
+        # continue 2/16's night, but 2/16 is a holiday (no session opened) -> break.
+        self.assertEqual(_get_session(datetime(2026, 2, 17, 2, 0)), "break")
+        self.assertEqual(_get_session(datetime(2026, 2, 17, 10, 0)), "break")
+        self.assertEqual(_get_session(datetime(2026, 2, 23, 10, 0)), "day")  # reopen Mon
+
+
 class WatchdogMondayDawnGatingTest(unittest.TestCase):
     def test_dead_feed_monday_dawn_no_alert_no_kill(self):
         # Reproduces 6/8 00:00 would-fire: feed dead ~9h, long uptime, not weekend (Mon).

@@ -14,6 +14,7 @@ import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state, load_mtx_product, rolled_over
 from settlement_calendar import is_settlement_window
+from market_holidays import is_trading_day
 from margin_headroom import headroom_low
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
@@ -224,21 +225,25 @@ def _get_session(dt: datetime) -> str:
     # the settled contract. Relies on caller passing TW-local (TZ_TW) datetime.
     if is_settlement_window(dt, _SETTLEMENT_OVERRIDE_DATE):
         return "break"
-    # Weekday-aware (2026-06-09): the night session runs 15:00 day D -> 05:00 day D+1
-    # for trading days D in Mon-Fri, so the early-morning leg (t < 05:00) is only a
-    # real session on Tue-Sat. Without this, Monday 00:00-05:00 was mislabeled "night"
-    # while the broker feed is legitimately dead (maintenance to ~07:20), which tripped
-    # the tick watchdog (would-fire kill observed 2026-06-08 00:00). See
-    # docs/superpowers/specs/2026-06-09-monday-dawn-session-gating-design.md
+    # Trading-day-aware (2026-06-09 weekday gate; 2026-06-18 holiday gate folded in).
+    # is_trading_day(d) = weekday AND not a TAIFEX holiday (market_holidays.py). The
+    # night session runs 15:00 day D -> 05:00 day D+1 for trading days D, so:
+    #   - day / night-start legs are active only when D itself is a trading day;
+    #   - the early-morning tail (t < 05:00) is the continuation of the PRIOR day's
+    #     night session, active only when that prior day was a trading day.
+    # This single check covers weekends, Monday-dawn (would-fire kill seen 6/8 00:00),
+    # and weekday public holidays (e.g. Fri 端午 6/19) in one place, so the armed tick /
+    # disconnect-storm watchdogs stay dormant on the dead holiday feed. The eve-of-
+    # holiday night session still runs to the holiday's 05:00 (handled by the prev-day
+    # tail check). See docs/superpowers/specs/2026-06-09-monday-dawn-session-gating-design.md
     t = dt.time()
-    wd = dt.weekday()                                   # Mon=0 .. Sun=6
-    if dtime(8, 45) <= t < dtime(13, 45) and wd <= 4:   # day: Mon-Fri 08:45-13:45
+    d = dt.date()
+    if dtime(8, 45) <= t < dtime(13, 45) and is_trading_day(d):   # day 08:45-13:45
         return "day"
-    if t >= dtime(15, 0) and wd <= 4:                   # night start leg: Mon-Fri 15:00+
+    if t >= dtime(15, 0) and is_trading_day(d):                   # night start 15:00+
         return "night"
-    if t < dtime(5, 0) and 1 <= wd <= 5:                # night tail leg: Tue-Sat 00:00-05:00
-        # Sat (wd=5) is included: it's the continuation of Friday's 15:00 night start.
-        return "night"
+    if t < dtime(5, 0) and is_trading_day(d - timedelta(days=1)): # night tail 00:00-05:00
+        return "night"                                            # = prior day's night session
     return "break"
 
 
@@ -528,9 +533,9 @@ class MTXStrategy:
 
     def on_disconnect(self):
         # Disconnect-storm circuit breaker (runs first, on every disconnect event).
-        # Active only inside a real trading session — _get_session is weekday-aware
-        # and returns "break" for weekends / Mon-dawn maintenance / break windows,
-        # so market-closed disconnects never trip a restart.
+        # Active only inside a real trading session — _get_session is trading-day-aware
+        # and returns "break" for weekends / Mon-dawn maintenance / public holidays /
+        # break windows, so market-closed disconnects never trip a restart.
         # Thread-safety: the SDK dispatches on_disconnect on a single callback
         # thread, so _disc_wd's unlocked deque is safe.  If a future SDK upgrade
         # dispatches callbacks concurrently, revisit (add a lock around record_and_check).
@@ -541,9 +546,12 @@ class MTXStrategy:
         with self._lock:
             units = self._flatten_units()
         logger.warning(f"Disconnected | local units={len(units)}")
-        # Weekend: market closed → broker disconnect expected, suppress Telegram notify
-        if datetime.now(TZ_TW).weekday() >= 5:
-            logger.info("Disconnect notify suppressed (weekend)")
+        # Market closed (weekend / holiday / break window) → disconnect expected,
+        # suppress Telegram notify. _current_session is holiday-aware via _get_session;
+        # note the live holiday-dawn eve session is "night" (not break) so real-session
+        # disconnects still alert.
+        if self._current_session == "break":
+            logger.info("Disconnect notify suppressed (market closed)")
             return
         if units:
             pos_desc = ", ".join(
@@ -565,9 +573,9 @@ class MTXStrategy:
         local_dir = "long" if net > 0 else ("short" if net < 0 else None)
         logger.warning(f"Reconnected | local_units={len(units)} net={net} | broker={broker_pos}")
 
-        # Weekend: market closed → suppress Telegram notify (same rationale as on_disconnect)
-        if datetime.now(TZ_TW).weekday() >= 5:
-            logger.info("Reconnect notify suppressed (weekend)")
+        # Market closed (weekend / holiday / break) → suppress (same rationale as on_disconnect)
+        if self._current_session == "break":
+            logger.info("Reconnect notify suppressed (market closed)")
             return
 
         if broker_pos is SCHEMA_FAIL:
