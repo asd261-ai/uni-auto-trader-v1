@@ -8,11 +8,21 @@ history — which mis-paired today's first close against a stale 5-day-old leg
 shared-account trades. These tests pin the correct behaviour.
 """
 import unittest
-from pnl_calc import summarize_real_pnl
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from pnl_calc import summarize_real_pnl, _parse_iso, _trading_day_window, bot_ordernos
 
 
 def rec(trading_day, real, signal=0.0, source="mtx"):
     return {"trading_day": trading_day, "pnl_pts_real": real, "pnl_pts": signal, "source": source}
+
+
+def _sent(ts, pid="MXFG6", bs="B"):
+    return {"ts": ts, "event": "sent", "productid": pid, "bs": bs}
+
+
+def _reply(ts, ono, pid="MXFG6", bs="B"):
+    return {"ts": ts, "event": "reply", "productid": pid, "bs": bs, "orderno": ono}
 
 
 class SummarizeRealPnlTest(unittest.TestCase):
@@ -56,6 +66,203 @@ class SummarizeRealPnlTest(unittest.TestCase):
         self.assertEqual(out["real_trading_day_trades"], 0)
         self.assertEqual(out["real_month_pnl_pts"], 0)
         self.assertEqual(out["real_day_missing_fill"], 0)
+
+
+class TimeHelpersTest(unittest.TestCase):
+    def test_parse_iso_with_offset(self):
+        dt = _parse_iso("2026-06-19T02:52:40+08:00")
+        self.assertEqual(dt, datetime(2026, 6, 19, 2, 52, 40,
+                                      tzinfo=timezone(timedelta(hours=8))))
+
+    def test_parse_iso_bad_returns_none(self):
+        self.assertIsNone(_parse_iso("not-a-timestamp"))
+        self.assertIsNone(_parse_iso(None))
+
+    def test_trading_day_window_spans_0845_to_0845(self):
+        start, end = _trading_day_window("2026-06-18")
+        tz = ZoneInfo("Asia/Taipei")
+        self.assertEqual(start, datetime(2026, 6, 18, 8, 45, tzinfo=tz))
+        self.assertEqual(end,   datetime(2026, 6, 19, 8, 45, tzinfo=tz))
+
+    def test_window_includes_after_midnight_night_fill(self):
+        # a night-session fill at 02:52 on 6/19 belongs to trading-day 6/18
+        start, end = _trading_day_window("2026-06-18")
+        night = _parse_iso("2026-06-19T02:52:40+08:00")
+        self.assertTrue(start <= night < end)
+
+    def test_window_lower_boundary_is_start(self):
+        # 08:45:00 sharp is the inclusive lower edge of the window.
+        start, end = _trading_day_window("2026-06-18")
+        self.assertEqual(start, _parse_iso("2026-06-18T08:45:00+08:00"))
+
+    def test_consecutive_windows_have_no_gap(self):
+        # end of one trading day == start of the next: half-open [start,end) tiling,
+        # no 1-second hole that could drop a fill for the fuse.
+        _, end_prev = _trading_day_window("2026-06-17")
+        start_next, _ = _trading_day_window("2026-06-18")
+        self.assertEqual(end_prev, start_next)
+
+
+class BotOrdernosTest(unittest.TestCase):
+    def test_sent_backed_reply_is_bot(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00"),
+                _reply("2026-06-18T10:00:00+08:00", "QN001")]
+        self.assertEqual(bot_ordernos(rows), {"QN001"})
+
+    def test_orphan_reply_no_sent_is_manual(self):
+        # Sean's manual MXFH6 fill: a reply/match with no preceding bot 'sent'.
+        rows = [_reply("2026-06-18T10:00:00+08:00", "QN999", pid="MXFH6")]
+        self.assertEqual(bot_ordernos(rows), set())
+
+    def test_two_sents_same_second_claim_distinct_replies(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00"),
+                _sent("2026-06-18T10:00:00+08:00"),
+                _reply("2026-06-18T10:00:00+08:00", "QN001"),
+                _reply("2026-06-18T10:00:00+08:00", "QN002")]
+        self.assertEqual(bot_ordernos(rows), {"QN001", "QN002"})
+
+    def test_reply_outside_3s_window_not_matched(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00"),
+                _reply("2026-06-18T10:00:10+08:00", "QN001")]  # 10s later
+        self.assertEqual(bot_ordernos(rows), set())
+
+    def test_different_product_not_matched(self):
+        rows = [_sent("2026-06-18T10:00:00+08:00", pid="MXFG6"),
+                _reply("2026-06-18T10:00:00+08:00", "QN001", pid="MXFH6")]
+        self.assertEqual(bot_ordernos(rows), set())
+
+
+from pnl_calc import realized_day_pts
+
+
+def _match(ts, ono, bs, price, pid="MXFG6", qty=1):
+    return {"ts": ts, "event": "match", "productid": pid, "bs": bs,
+            "orderno": ono, "matchprice": price, "matchqty": qty}
+
+
+class RealizedDayPtsTest(unittest.TestCase):
+    def setUp(self):
+        self.start, self.end = _trading_day_window("2026-06-18")
+
+    def _long_roundtrip(self, t1, t2, ono_in, ono_out, ein, eout):
+        # bot long: sent+reply open (B), sent+reply close (S)
+        return [_sent(t1, bs="B"), _reply(t1, ono_in, bs="B"),
+                _match(t1, ono_in, "B", ein),
+                _sent(t2, bs="S"), _reply(t2, ono_out, bs="S"),
+                _match(t2, ono_out, "S", eout)]
+
+    def test_bot_only_roundtrip_realizes_correctly(self):
+        rows = self._long_roundtrip("2026-06-18T10:00:00+08:00",
+                                    "2026-06-18T10:10:00+08:00",
+                                    "QN1", "QN2", 46430.0, 46508.0)
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 78.0)   # long: 46508 - 46430
+        self.assertEqual(trips, 1)
+
+    def test_manual_fill_no_sent_excluded(self):
+        rows = self._long_roundtrip("2026-06-18T10:00:00+08:00",
+                                    "2026-06-18T10:10:00+08:00",
+                                    "QN1", "QN2", 46430.0, 46508.0)
+        # Sean's manual MXFH6 round-trip: match events with NO sent backing them.
+        rows += [_match("2026-06-18T11:00:00+08:00", "M1", "S", 50000.0, pid="MXFH6"),
+                 _match("2026-06-18T11:05:00+08:00", "M2", "B", 49000.0, pid="MXFH6")]
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 78.0)   # manual MXFH6 ignored
+        self.assertEqual(trips, 1)
+
+    def test_two_products_fifo_independently_no_cross_pair(self):
+        # settlement-day style: bot fills on old + new contract; each FIFOs alone.
+        rows = self._long_roundtrip("2026-06-18T10:00:00+08:00",
+                                    "2026-06-18T10:10:00+08:00",
+                                    "QN1", "QN2", 46430.0, 46508.0)  # MXFG6 +78
+        g = [_sent("2026-06-18T11:00:00+08:00", pid="MXFH6", bs="S"),
+             _reply("2026-06-18T11:00:00+08:00", "QN3", pid="MXFH6", bs="S"),
+             _match("2026-06-18T11:00:00+08:00", "QN3", "S", 47000.0, pid="MXFH6"),
+             _sent("2026-06-18T11:10:00+08:00", pid="MXFH6", bs="B"),
+             _reply("2026-06-18T11:10:00+08:00", "QN4", pid="MXFH6", bs="B"),
+             _match("2026-06-18T11:10:00+08:00", "QN4", "B", 46980.0, pid="MXFH6")]  # short +20
+        pts, trips = realized_day_pts(rows + g, self.start, self.end)
+        self.assertEqual(pts, 98.0)   # 78 (MXFG6 long) + 20 (MXFH6 short), no cross-pair
+        self.assertEqual(trips, 2)
+
+    def test_null_pnl_pts_real_trade_still_captured(self):
+        # The +170-vs-+167 case: a trade whose exit_fill was never stamped (so
+        # trades.jsonl pnl_pts_real is None) STILL has real match fills here.
+        rows = self._long_roundtrip("2026-06-19T03:00:00+08:00",
+                                    "2026-06-19T03:05:00+08:00",
+                                    "QN1", "QN2", 47545.0, 47480.0)  # long: 47480-47545 = -65
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, -65.0)
+        self.assertEqual(trips, 1)
+
+    def test_stale_leg_before_window_excluded(self):
+        # An unmatched bot leg dated before the window must not pair with today's
+        # close (the +2176 regression). Only the in-window open should remain open.
+        rows = [_sent("2026-06-12T10:00:00+08:00", bs="B"),
+                _reply("2026-06-12T10:00:00+08:00", "OLD", bs="B"),
+                _match("2026-06-12T10:00:00+08:00", "OLD", "B", 43946.0),  # 6/12 stale
+                _sent("2026-06-18T10:00:00+08:00", bs="S"),
+                _reply("2026-06-18T10:00:00+08:00", "QN2", bs="S"),
+                _match("2026-06-18T10:00:00+08:00", "QN2", "S", 46508.0)]  # today close
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 0.0)   # stale 6/12 leg out of window; today's lone S stays open
+        self.assertEqual(trips, 0)
+
+    def test_empty_is_flat_zero(self):
+        self.assertEqual(realized_day_pts([], self.start, self.end), (0.0, 0))
+
+
+from pnl_calc import divergence_warn
+
+
+class DivergenceWarnTest(unittest.TestCase):
+    def test_agree_no_warn(self):
+        self.assertFalse(divergence_warn(170.0, 170.0, 0))
+
+    def test_disagree_with_missing_fills_no_warn(self):
+        # +170 FIFO vs +167 per-trade is EXPECTED when 3 exits were unstamped.
+        self.assertFalse(divergence_warn(170.0, 167.0, 3))
+
+    def test_disagree_zero_missing_warns(self):
+        # disagreement with nothing missing => provenance/data problem.
+        self.assertTrue(divergence_warn(170.0, 150.0, 0))
+
+    def test_within_tolerance_no_warn(self):
+        self.assertFalse(divergence_warn(170.0, 169.5, 0))
+
+    def test_none_fifo_no_warn(self):
+        self.assertFalse(divergence_warn(None, 167.0, 0))
+
+
+import os, tempfile
+import pnl_calc as pc
+
+
+class ComputeWiringTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _write(self, name, lines):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w", encoding="utf-8") as f:
+            for l in lines:
+                f.write(l + "\n")
+        return p
+
+    def test_read_orders_raw_missing_file_raises(self):
+        # _read_orders_raw on a non-existent path raises -> _compute maps to None.
+        with self.assertRaises(Exception):
+            pc._read_orders_raw(os.path.join(self.tmp, "nope.jsonl"))
+
+    def test_read_orders_raw_skips_bad_lines(self):
+        p = self._write("orders.jsonl",
+                        ['{"event":"match","orderno":"Q1"}', 'GARBAGE', '{"event":"sent"}'])
+        rows = pc._read_orders_raw(p)
+        self.assertEqual(len(rows), 2)   # garbage skipped
+
+    def test_read_orders_raw_empty_file_is_empty_list(self):
+        p = self._write("orders.jsonl", [])
+        self.assertEqual(pc._read_orders_raw(p), [])
 
 
 if __name__ == "__main__":

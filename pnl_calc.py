@@ -1,25 +1,92 @@
-"""READ-ONLY 真實成交 P&L,從 trades.jsonl 每筆自己的 pnl_pts_real 加總算出。
+"""READ-ONLY 真實成交 P&L — 當日已實現損益以「逐精確商品 FIFO」計算,為心跳 + 每日最大虧損熔斷的 AUTHORITATIVE 來源。
 
-2026-06-18 修正(原本 FIFO orders.jsonl 全歷史的做法有兩個 bug):
-  1. 無 boot/session floor → 今日第一筆平倉被配到 5 天前的陳舊未平腿
-     (例:6/12 L@43946),把單筆灌成 +2176,後續整列錯位一格(報 +322,
-     真實 −47/−54)。
-  2. 共用帳號:當 bot 與 Sean 手動單在同一個月份合約(都 MXFG6)時,
-     contract-base 過濾擋不掉手動單 → 污染 bot P&L / 熔斷輸入。
-改用 trades.jsonl 的 pnl_pts_real(real_fill_pnl 在每筆進/出場時各自記下的成交價配對):
-  • bot-only by construction — trades.jsonl 只記 bot 自己的交易,手動單永遠不在裡面;
-  • 每筆配自己的腿 → 免疫陳舊腿 / 跨歷史 FIFO 污染;
-  • pnl_pts_real 為 None(紙上單 or 缺 fill)者排除、不灌水、另計數。
-Additive:不碰下單流程、不碰訊號版計數。Restart-safe:trades.jsonl 持久且開機還原。
-快取 ~30s,並以 08:45 交易日窗為 key(日界一過即失效,避免熔斷讀到昨日全日 P&L)。
+【設計重點:Provenance-FIFO,2026-06-19】
+計算方式:讀取 orders.jsonl,按精確 productid(如 MXFG6)各自 FIFO 配對平倉。
+僅納入 bot 自身成交,透過 sent→reply(orderno)→match 事件鏈(bot_ordernos)追溯來源,
+確保 manual/非 bot 單結構性排除。原因:共用帳號下 bot 下 MXFG6、Sean 手動下 MXFH6 等不同月份
+合約,兩者無 `sent` 事件關聯,故天然隔離,不污染 bot P&L 或熔斷輸入。
+窗口 floor = 當日 08:45 TW,阻擋跨日陳舊腿(解決 +2176/+322 誤配 bug)。
+逐商品 FIFO 確保結算換倉日新舊合約不互相配對。
+FIFO realized 值為主要輸出(realized_day_pts),喂入 heartbeat realPnl 及 DAILY_MAX_LOSS 熔斷。
+
+【平行交叉驗證】
+trades.jsonl 的 per-trade pnl_pts_real 加總仍保留為副線(summarize_real_pnl),
+提供 real_month_pnl_pts + real_day_missing_fill。
+divergence_warn() 在兩者差異且無缺 fill 時記 WARNING,協助早期偵測數據異常。
+
+【Fail-open 設計】
+orders.jsonl 無法讀取時回傳 None → 熔斷視為無資料,不鎖倉、不憑空生成數字。
+
+【快取】
+~30s 快取,以 08:45 交易日窗為 key;日界一過即失效,避免熔斷讀到前日累計 P&L。
+
+設計文件:docs/superpowers/specs/2026-06-19-pnl-provenance-fifo-design.md
 """
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
+_log = logging.getLogger("pnl_calc")
+
 _TZ = ZoneInfo("Asia/Taipei")
+
+
+def _parse_iso(ts):
+    """Parse an ISO-8601 string (e.g. '2026-06-19T02:52:40+08:00') to an aware
+    datetime. Returns None on any malformed / non-string input."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def _trading_day_window(td):
+    """[start, end) aware-datetime bounds for a trading day's 08:45 TW window.
+    A day labelled 2026-06-18 spans 2026-06-18 08:45 → 2026-06-19 08:45, so a
+    night-session round-trip closing after midnight still falls inside."""
+    d = datetime.strptime(td, "%Y-%m-%d").date()
+    start = datetime.combine(d, dtime(8, 45), _TZ)
+    return start, start + timedelta(days=1)
+
+
+_LINK_WINDOW_SEC = 3  # max gap from a bot 'sent' to its 'reply' (real data: same second)
+
+
+def bot_ordernos(rows):
+    """Set of ordernos the bot actually sent. A 'sent' event carries no orderno;
+    it is paired to the first unclaimed 'reply' (which has the orderno) within
+    _LINK_WINDOW_SEC seconds sharing productid + bs. Manual/non-bot fills have no
+    'sent' and are therefore excluded. See provenance design 2026-06-19."""
+    sents, replies = [], []
+    for r in rows:
+        ev = r.get("event")
+        ts = _parse_iso(r.get("ts"))
+        if ts is None:
+            continue
+        if ev == "sent":
+            sents.append((ts, r.get("productid"), r.get("bs")))
+        elif ev == "reply" and r.get("orderno"):
+            replies.append((ts, r.get("productid"), r.get("bs"), r.get("orderno")))
+    sents.sort(key=lambda x: x[0])
+    replies.sort(key=lambda x: x[0])
+    claimed = set()
+    bot = set()
+    for sts, spid, sbs in sents:
+        for i, (rts, rpid, rbs, ono) in enumerate(replies):
+            if i in claimed:
+                continue
+            if rpid == spid and rbs == sbs and 0 <= (rts - sts).total_seconds() <= _LINK_WINDOW_SEC:
+                bot.add(ono)
+                claimed.add(i)
+                break
+    return bot
+
+
 _TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.jsonl")
 _STATE_PATH = os.path.join(os.path.dirname(__file__), "mtx_state.json")
 _CACHE = {"ts": 0.0, "val": None, "day": None}
@@ -124,6 +191,54 @@ def _fifo(fills):
     return closed, pos
 
 
+def realized_day_pts(rows, start, end):
+    """(realized_points, round_trips) from bot match fills inside [start, end),
+    FIFO'd per EXACT contract. Provenance (bot_ordernos) drops manual/non-bot
+    fills; the window drops stale prior-day legs; per-product grouping prevents
+    cross-contract pairing on a settlement-day rollover. Open legs stay open
+    (unrealized, not counted)."""
+    bot = bot_ordernos(rows)
+    by_pid = {}
+    for r in rows:
+        if r.get("event") != "match" or r.get("orderno") not in bot:
+            continue
+        ts = _parse_iso(r.get("ts"))
+        if ts is None or not (start <= ts < end):
+            continue
+        bs = r.get("bs")
+        price = r.get("matchprice")
+        if bs not in ("B", "S") or price is None:
+            continue
+        qty = int(r.get("matchqty") or 1)
+        for _ in range(max(1, qty)):
+            by_pid.setdefault(r.get("productid"), []).append((ts, bs, float(price)))
+    total = 0.0
+    trips = 0
+    for fills in by_pid.values():
+        fills.sort(key=lambda x: x[0])
+        closed, _open = _fifo(fills)
+        total += sum(pnl for _ts, pnl in closed)
+        trips += len(closed)
+    return round(total, 1), trips
+
+
+def _read_orders_raw(path=None):
+    """Parsed orders.jsonl rows (bad JSON lines skipped). Raises if the file is
+    absent/unreadable so _compute can fail-open to None. An empty file -> []."""
+    p = path or os.path.join(os.path.dirname(__file__), "orders.jsonl")
+    out = []
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
 def _read_trades():
     out = []
     if not os.path.exists(_TRADES_PATH):
@@ -164,9 +279,40 @@ def _real_open() -> str:
 
 
 def _compute(base=None):
-    out = summarize_real_pnl(_read_trades(), _today_trading_day())
-    out["real_open"] = _real_open()
-    return out
+    td = _today_trading_day()
+    xcheck = summarize_real_pnl(_read_trades(), td)   # per-trade sum + month + missing
+    start, end = _trading_day_window(td)
+    try:
+        day_pnl, day_trades = realized_day_pts(_read_orders_raw(), start, end)
+    except Exception:
+        day_pnl, day_trades = None, None              # fail-open: breaker sees no-data
+    if divergence_warn(day_pnl, xcheck["real_trading_day_pnl_pts"],
+                       xcheck["real_day_missing_fill"]):
+        _log.warning("PNL_DIVERGENCE: orders-FIFO=%s vs per-trade=%s (missing_fill=0) "
+                     "— check provenance/data", day_pnl, xcheck["real_trading_day_pnl_pts"])
+    return {
+        "real_trading_day_pnl_pts": day_pnl,                              # FIFO -> breaker
+        "real_trading_day_trades":  day_trades,
+        "real_month_pnl_pts":       xcheck["real_month_pnl_pts"],         # display (per-trade)
+        "real_day_missing_fill":    xcheck["real_day_missing_fill"],
+        "real_day_pnl_pertrade":    xcheck["real_trading_day_pnl_pts"],   # visibility
+        "real_open":                _real_open(),
+    }
+
+
+_DIVERGENCE_TOL_PTS = 1.0
+
+
+def divergence_warn(fifo_pts, pertrade_pts, missing_fill):
+    """True when the authoritative orders-FIFO value and the per-trade pnl_pts_real
+    sum disagree by more than _DIVERGENCE_TOL_PTS with ZERO missing fills — a
+    disagreement not explained by unstamped exits, so a provenance/data smell worth
+    a log line. Never blocks the breaker."""
+    if fifo_pts is None or pertrade_pts is None:
+        return False
+    if missing_fill != 0:
+        return False
+    return abs(fifo_pts - pertrade_pts) > _DIVERGENCE_TOL_PTS
 
 
 def heartbeat_fields(base: str = "MXF") -> dict:
@@ -190,7 +336,8 @@ def heartbeat_fields(base: str = "MXF") -> dict:
                              "real_trading_day_trades": None,
                              "real_month_pnl_pts": None,
                              "real_open": "err",
-                             "real_day_missing_fill": None}
+                             "real_day_missing_fill": None,
+                             "real_day_pnl_pertrade": None}
         _CACHE["ts"] = now
         _CACHE["day"] = day
     return _CACHE["val"]
