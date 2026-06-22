@@ -26,6 +26,7 @@ from entry_guard import entry_past_target  # skip entries whose live fill is alr
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
 from pollloop_watchdog import PollLoopLivenessWatchdog
+from fd_watchdog import FdLeakWatchdog
 from disconnect_watchdog import DisconnectStormWatchdog
 import order_reject
 import real_fill_pnl  # task B: real-fill P&L fields for trades.jsonl
@@ -194,6 +195,17 @@ POLLLOOP_FREEZE_SEC       = int(os.getenv("POLLLOOP_FREEZE_SEC", "120"))
 POLLLOOP_FREEZE_CHECK_SEC = int(os.getenv("POLLLOOP_FREEZE_CHECK_SEC", "30"))
 POLLLOOP_FREEZE_GRACE_SEC = int(os.getenv("POLLLOOP_FREEZE_GRACE_SEC", "180"))
 POLLLOOP_FREEZE_KILL      = os.getenv("POLLLOOP_FREEZE_KILL", "off").lower() == "on"
+# File-descriptor leak watchdog: the SDK leaks a socket per reconnect; open fds
+# climb toward the Python select() 1024 wall (2026-06-22 incident, open_fds=1026).
+# Restart to reclaim fds before the wall. Soft tier (flat-only) armed by default
+# — a flat restart is benign; hard tier (any position) observe by default. See
+# design spec 2026-06-22.
+FD_LEAK_SOFT      = int(os.getenv("FD_LEAK_SOFT", "800"))
+FD_LEAK_HARD      = int(os.getenv("FD_LEAK_HARD", "980"))
+FD_LEAK_CHECK_SEC = int(os.getenv("FD_LEAK_CHECK_SEC", "30"))
+FD_LEAK_GRACE_SEC = int(os.getenv("FD_LEAK_GRACE_SEC", "180"))
+FD_LEAK_SOFT_KILL = os.getenv("FD_LEAK_SOFT_KILL", "on").lower() == "on"    # armed by default (flat restart benign)
+FD_LEAK_HARD_KILL = os.getenv("FD_LEAK_HARD_KILL", "off").lower() == "on"   # observe-first
 # Consecutive broker-read-unavailable (schema-drift or SDK timeout, both surface
 # as SCHEMA_FAIL from _query_broker_position) streak before a Health-bot alert.
 SDK_READ_TIMEOUT_ALERT_N  = int(os.getenv("SDK_READ_TIMEOUT_ALERT_N", "3"))
@@ -381,6 +393,15 @@ class MTXStrategy:
             check_interval=POLLLOOP_FREEZE_CHECK_SEC,
             kill_grace=POLLLOOP_FREEZE_GRACE_SEC,
         )
+        # File-descriptor leak watchdog: restart before the SDK's leaked fds hit
+        # the Python select() 1024 wall. Own thread; reads /proc + in-memory state
+        # only, never the broker SDK. Soft armed / hard observe by default.
+        self._fd_wd = FdLeakWatchdog(
+            soft_threshold=FD_LEAK_SOFT,
+            hard_threshold=FD_LEAK_HARD,
+            check_interval=FD_LEAK_CHECK_SEC,
+            kill_grace=FD_LEAK_GRACE_SEC,
+        )
 
         # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
         # order) so on_fill() attributes each Match to the right order even on
@@ -515,6 +536,7 @@ class MTXStrategy:
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
         threading.Thread(target=self._pollloop_wd_loop, daemon=True).start()
+        threading.Thread(target=self._fd_wd_loop, daemon=True).start()
         logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s | "
                     f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE} | "
                     f"fvg_boot_ts={self._fvg_boot_ts_ms} "
@@ -818,6 +840,40 @@ class MTXStrategy:
             except Exception as e:
                 logger.debug(f"pollloop-wd error (silent): {e}")
             time.sleep(POLLLOOP_FREEZE_CHECK_SEC)
+
+    def _fd_open_count(self):
+        # Pure-Python open-fd count via /proc; touches no broker SDK / network.
+        # Returns None on read failure (never kill on missing data).
+        try:
+            import os as _os
+            return len(_os.listdir("/proc/self/fd"))
+        except Exception:
+            return None
+
+    def _position_is_flat(self) -> bool:
+        # In-memory only: no broker call (the watchdog thread must never block on
+        # the SDK). Mirrors the flat notion used by precheck Gate 3 / reconcile.
+        return (not self._units.get("mtx")
+                and not self._units.get("fvg")
+                and not self._pending_fills)
+
+    def _fd_wd_loop(self) -> None:
+        # Runs in its OWN daemon thread, never the poll loop. Reads /proc/self/fd
+        # (never blocks) and the in-memory position state — never the broker SDK.
+        while self._running:
+            try:
+                fd_count = self._fd_open_count()
+                if fd_count is not None:
+                    self._fd_wd.check(
+                        time.monotonic(),
+                        fd_count=fd_count,
+                        uptime=time.monotonic() - self._proc_start_monotonic,
+                        is_flat=self._position_is_flat(),
+                        on_kill=self._fd_wd_kill,
+                    )
+            except Exception as e:
+                logger.debug(f"fd-wd error (silent): {e}")
+            time.sleep(FD_LEAK_CHECK_SEC)
 
     def _check_session_change(self):
         now     = datetime.now(TZ_TW)
@@ -2125,6 +2181,22 @@ class MTXStrategy:
         logger.error(f"[pollloop-wd KILL] {msg}")
         try:
             self._safe_health_notify(f"🔪 Trader self-restart (poll-loop freeze): {msg}")
+        except Exception:
+            pass
+        import os as _os
+        _os._exit(1)
+
+    def _fd_wd_kill(self, msg: str, tier: str) -> None:
+        # Soft tier armed by default (FD_LEAK_SOFT_KILL on); hard tier observe by
+        # default (FD_LEAK_HARD_KILL off) → log would-fire, do NOT exit until armed.
+        # Armed: alert then os._exit(1) so systemd restarts and the OS reclaims fds.
+        armed = FD_LEAK_HARD_KILL if tier == "hard" else FD_LEAK_SOFT_KILL
+        if not armed:
+            logger.error(f"[fd-wd KILL would-fire] {msg}")
+            return
+        logger.error(f"[fd-wd KILL] {msg}")
+        try:
+            self._safe_health_notify(f"🔪 Trader self-restart (fd-leak {tier}): {msg}")
         except Exception:
             pass
         import os as _os
