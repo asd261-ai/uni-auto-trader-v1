@@ -8,6 +8,11 @@ from order_reject import is_reject_status
 from sdk_timeout import call_with_timeout, SDKCallTimeout
 
 SDK_READ_TIMEOUT_SEC = float(os.getenv("SDK_READ_TIMEOUT_SEC", "5"))
+# dquote auto-resubscribe: recover the tick feed in-place before the tick-stale kill
+# restarts the process. Observe-first: off = log the would-fire only, on = actually
+# unsubscribe+subscribe. See docs/superpowers/specs/2026-06-23-dquote-resubscribe-design.md.
+DQUOTE_RESUB              = os.getenv("DQUOTE_RESUB", "off").lower() == "on"
+DQUOTE_RESUB_MIN_INTERVAL = float(os.getenv("DQUOTE_RESUB_MIN_INTERVAL", "30"))  # min secs between resubscribe calls (any trigger)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +25,7 @@ class AutoTrader:
         self._running = False
         self._connected = False  # 首次連線後才為 True，用於區分首次 vs 重連
         self.strategy = None  # 由外部注入 MTXStrategy
+        self._last_resub_ts = 0.0  # last dquote resubscribe attempt (min-interval guard)
 
     # ── 啟動 / 停止 ──────────────────────────────────────────────
 
@@ -119,6 +125,42 @@ class AutoTrader:
             return
         logger.info(f"Subscribed to {self.config['product']}")
 
+    def resubscribe_dquote(self, reason: str) -> bool:
+        """Recover the dquote tick feed by unsubscribe+subscribe.
+
+        Invoked on a dtrade reconnect (trigger B) and by the tick-stale-driven policy
+        in the poll loop (trigger A). Observe-first: DQUOTE_RESUB off -> log the
+        would-fire and make NO SDK call. A min-interval guard prevents A+B overlap and
+        reconnect-storm spam. Never raises (preserves the no-zombie philosophy of
+        _subscribe); on failure the tick-stale kill is the backstop. Returns True iff a
+        subscribe succeeded.
+        """
+        now = time.time()
+        if now - self._last_resub_ts < DQUOTE_RESUB_MIN_INTERVAL:
+            return False
+        self._last_resub_ts = now
+        product = self.config["product"]
+        if not DQUOTE_RESUB:
+            logger.warning(f"[dquote-resub would-fire] reason={reason} product={product}")
+            return False
+        # Best-effort unsubscribe first (SDK may reject a duplicate subscribe); ignore outcome.
+        try:
+            call_with_timeout(self.api.dquote.unsubscribe_trade_bid_offer, product,
+                              timeout=SDK_READ_TIMEOUT_SEC)
+        except Exception as e:
+            logger.debug(f"dquote unsubscribe (pre-resub) ignored: {e}")
+        try:
+            ok, err = call_with_timeout(self.api.dquote.subscribe_trade_bid_offer, product,
+                                        timeout=SDK_READ_TIMEOUT_SEC)
+        except Exception as e:
+            logger.warning(f"[dquote-resub] subscribe call failed (reason={reason}): {e}")
+            return False
+        if not ok:
+            logger.warning(f"[dquote-resub] subscribe not-ok (reason={reason}): {err}")
+            return False
+        logger.info(f"[dquote-resub] resubscribed to {product} (reason={reason})")
+        return True
+
     # ── 事件回調 ──────────────────────────────────────────────────
 
     def _on_tick(self, tick):
@@ -174,6 +216,10 @@ class AutoTrader:
         broker_pos = self._query_broker_position()
         if self.strategy:
             self.strategy.on_reconnect(broker_pos)
+        # Trigger B: a dtrade reconnect means connectivity is restored — the dquote feed
+        # (a separate client with no auto-resubscribe) may still be dead. Attempt a
+        # resubscribe so the feed recovers without waiting for the tick-stale kill.
+        self.resubscribe_dquote("dtrade-reconnect")
 
     def _on_disconnected(self):
         status = getattr(self.api.dtrade, "last_disconnect_status", "unknown")
