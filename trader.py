@@ -135,14 +135,14 @@ class AutoTrader:
         _subscribe); on failure the tick-stale kill is the backstop. Returns True iff a
         subscribe succeeded.
         """
+        product = self.config["product"]
+        if not DQUOTE_RESUB:
+            logger.info(f"[dquote-resub would-fire] reason={reason} product={product}")
+            return False
         now = time.time()
         if now - self._last_resub_ts < DQUOTE_RESUB_MIN_INTERVAL:
             return False
         self._last_resub_ts = now
-        product = self.config["product"]
-        if not DQUOTE_RESUB:
-            logger.warning(f"[dquote-resub would-fire] reason={reason} product={product}")
-            return False
         # Best-effort unsubscribe first (SDK may reject a duplicate subscribe); ignore outcome.
         try:
             call_with_timeout(self.api.dquote.unsubscribe_trade_bid_offer, product,
