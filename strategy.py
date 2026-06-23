@@ -27,6 +27,7 @@ from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
 from pollloop_watchdog import PollLoopLivenessWatchdog
 from fd_watchdog import FdLeakWatchdog
+from dquote_resub import DquoteResubPolicy
 from disconnect_watchdog import DisconnectStormWatchdog
 import order_reject
 import real_fill_pnl  # task B: real-fill P&L fields for trades.jsonl
@@ -182,6 +183,11 @@ TICK_STALE_KILL_DAY_SEC   = int(os.getenv("TICK_STALE_KILL_DAY_SEC", "180"))
 TICK_STALE_KILL_NIGHT_SEC = int(os.getenv("TICK_STALE_KILL_NIGHT_SEC", "600"))
 TICK_STALE_KILL_GRACE_SEC = int(os.getenv("TICK_STALE_KILL_GRACE_SEC", "180"))
 TICK_STALE_KILL          = os.getenv("TICK_STALE_KILL", "off").lower() == "on"  # Phase B arms os._exit
+# dquote resubscribe policy (trigger A): rate-limits staleness-driven feed recovery,
+# gated on the tick-stale watchdog's `alerting` flag. See dquote_resub.py / design spec 2026-06-23.
+DQUOTE_RESUB_COOLDOWN = float(os.getenv("DQUOTE_RESUB_COOLDOWN", "60"))
+DQUOTE_RESUB_MAX      = int(os.getenv("DQUOTE_RESUB_MAX", "3"))
+DQUOTE_RESUB_GRACE    = float(os.getenv("DQUOTE_RESUB_GRACE", "180"))
 # Disconnect-storm circuit breaker: a broker reconnect storm recurses the SDK
 # native dispatch into a CPython C-stack overflow (SEGV ip 0x551368). Self-restart
 # cleanly before that point. Independent of TICK_STALE_KILL. Observe-default.
@@ -380,6 +386,14 @@ class MTXStrategy:
             kill_night_threshold=TICK_STALE_KILL_NIGHT_SEC,
             kill_grace=TICK_STALE_KILL_GRACE_SEC,
             check_interval=TICK_CHECK_INTERVAL_SEC,
+        )
+        # dquote resubscribe policy (trigger A): when the tick-stale watchdog is alerting,
+        # attempt an in-place resubscribe (rate-limited) before its kill tier restarts the
+        # process. The SDK call + observe/arm gating live in trader.resubscribe_dquote.
+        self._dquote_resub = DquoteResubPolicy(
+            cooldown=DQUOTE_RESUB_COOLDOWN,
+            max_attempts=DQUOTE_RESUB_MAX,
+            grace=DQUOTE_RESUB_GRACE,
         )
         self._disc_wd = DisconnectStormWatchdog(
             window_sec=DISCONNECT_STORM_WINDOW_SEC,
@@ -793,6 +807,19 @@ class MTXStrategy:
                 )
             except Exception as e:
                 logger.debug(f"tick watchdog error (silent): {e}")
+            # Trigger A: if the tick-stale watchdog is alerting (feed stale past the alert
+            # threshold, below the kill threshold), attempt an in-place dquote resubscribe
+            # before the kill tier escalates to a process restart. Rate-limited by the policy;
+            # the SDK call + observe/arm gating live in trader.resubscribe_dquote.
+            try:
+                if self._dquote_resub.should_attempt(
+                    time.time(),
+                    alerting=self._tick_wd.alerting,
+                    uptime=time.time() - self._proc_start_ts,
+                ):
+                    self.trader.resubscribe_dquote("tick-stale")
+            except Exception as e:
+                logger.debug(f"dquote-resub error (silent): {e}")
             # Fire-and-forget heartbeat — outside try/except so it fires even when poll itself
             # errors (watchdog needs to see "process alive but polls failing" as a signal).
             mtx_units = self._units.get("mtx", [])
