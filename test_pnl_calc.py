@@ -265,5 +265,39 @@ class ComputeWiringTest(unittest.TestCase):
         self.assertEqual(pc._read_orders_raw(p), [])
 
 
+class TestConservativeDayPnl(unittest.TestCase):
+    """conservative_day_pnl: canonical breaker/display value = the more-pessimistic of
+    the two real engines. Regression for 2026-06-24: orders-FIFO read +382 (a position
+    spanning the 08:45 boundary mis-paired) while per-trade + broker = -421; the breaker
+    and the per-close display must surface -421, never the optimistic +382."""
+
+    def test_picks_pertrade_when_fifo_wrongly_positive_0624(self):
+        # The real 2026-06-24 divergence: orders-FIFO +382 vs per-trade/broker -421.
+        self.assertEqual(pc.conservative_day_pnl(382.0, 9, -421.0, 10), (-421.0, 10))
+
+    def test_picks_fifo_when_pertrade_optimistic_missing_fill(self):
+        # per-trade undercounts a loss (missing exit fill); orders-FIFO is more negative.
+        self.assertEqual(pc.conservative_day_pnl(-500.0, 8, -400.0, 7), (-500.0, 8))
+
+    def test_both_negative_takes_more_negative(self):
+        self.assertEqual(pc.conservative_day_pnl(-100.0, 3, -250.0, 4), (-250.0, 4))
+
+    def test_both_positive_takes_smaller(self):
+        self.assertEqual(pc.conservative_day_pnl(300.0, 6, 120.0, 5), (120.0, 5))
+
+    def test_tie_prefers_pertrade(self):
+        self.assertEqual(pc.conservative_day_pnl(-120.0, 5, -120.0, 5), (-120.0, 5))
+
+    def test_fifo_none_falls_back_to_pertrade(self):
+        self.assertEqual(pc.conservative_day_pnl(None, None, -50.0, 2), (-50.0, 2))
+
+    def test_pertrade_none_falls_back_to_fifo(self):
+        self.assertEqual(pc.conservative_day_pnl(75.0, 1, None, None), (75.0, 1))
+
+    def test_both_none_fails_open(self):
+        # Both engines no-data → (None, None) so the breaker fail-opens (no lock).
+        self.assertEqual(pc.conservative_day_pnl(None, None, None, None), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

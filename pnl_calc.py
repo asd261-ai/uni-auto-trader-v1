@@ -290,12 +290,22 @@ def _compute(base=None):
                        xcheck["real_day_missing_fill"]):
         _log.warning("PNL_DIVERGENCE: orders-FIFO=%s vs per-trade=%s (missing_fill=0) "
                      "— check provenance/data", day_pnl, xcheck["real_trading_day_pnl_pts"])
+    # Canonical P&L for the loss breaker + 📈 display = the more-pessimistic of the two
+    # real engines (fail-safe). orders-FIFO mis-pairs a position spanning the 08:45
+    # boundary — its pre-window open leg is window-filtered out, so the in-window close
+    # is mis-read as a new open, corrupting the day (2026-06-24: orders-FIFO +382 vs
+    # broker −421). per-trade excludes missing-fill trades (optimistic). min() is the
+    # safe direction for a LOSS breaker and matched broker on 2026-06-24. (Sean 2026-06-25)
+    canon_pnl, canon_trades = conservative_day_pnl(
+        day_pnl, day_trades,
+        xcheck["real_trading_day_pnl_pts"], xcheck["real_trading_day_trades"])
     return {
-        "real_trading_day_pnl_pts": day_pnl,                              # FIFO -> breaker
-        "real_trading_day_trades":  day_trades,
+        "real_trading_day_pnl_pts": canon_pnl,                           # conservative -> breaker
+        "real_trading_day_trades":  canon_trades,
         "real_month_pnl_pts":       xcheck["real_month_pnl_pts"],         # display (per-trade)
         "real_day_missing_fill":    xcheck["real_day_missing_fill"],
-        "real_day_pnl_pertrade":    xcheck["real_trading_day_pnl_pts"],   # visibility
+        "real_day_pnl_fifo":        day_pnl,                              # visibility: raw orders-FIFO
+        "real_day_pnl_pertrade":    xcheck["real_trading_day_pnl_pts"],   # visibility: per-trade
         "real_open":                _real_open(),
     }
 
@@ -313,6 +323,33 @@ def divergence_warn(fifo_pts, pertrade_pts, missing_fill):
     if missing_fill != 0:
         return False
     return abs(fifo_pts - pertrade_pts) > _DIVERGENCE_TOL_PTS
+
+
+def conservative_day_pnl(fifo_pnl, fifo_trades, pt_pnl, pt_trades):
+    """Fail-safe canonical daily realized P&L = the more-pessimistic of the two real
+    engines (orders-FIFO vs per-trade pnl_pts_real). Returns (pnl, trades).
+
+    Why min(), not either alone — neither engine is trustworthy in every regime, and
+    BOTH failure modes bias OPTIMISTIC, so the safe value for a LOSS breaker is the
+    more-negative one:
+    - orders-FIFO mis-pairs a position spanning the 08:45 window boundary (the pre-
+      window open leg is window-filtered out → the in-window close is mis-read as a new
+      open), which can swing the day wildly positive (2026-06-24: +382 vs broker −421).
+    - per-trade excludes trades whose real exit fill is missing (null pnl_pts_real),
+      which undercounts losses → optimistic.
+    Ties prefer per-trade (structurally bot-only + self-paired; matched broker 2026-06-24).
+    None inputs fall back to whichever is available; both None → (None, None) so the
+    breaker fail-opens (no lock on no data). (Sean 2026-06-25)
+    """
+    if fifo_pnl is None and pt_pnl is None:
+        return None, None
+    if fifo_pnl is None:
+        return pt_pnl, pt_trades
+    if pt_pnl is None:
+        return fifo_pnl, fifo_trades
+    if pt_pnl <= fifo_pnl:
+        return pt_pnl, pt_trades
+    return fifo_pnl, fifo_trades
 
 
 def heartbeat_fields(base: str = "MXF") -> dict:
@@ -337,6 +374,7 @@ def heartbeat_fields(base: str = "MXF") -> dict:
                              "real_month_pnl_pts": None,
                              "real_open": "err",
                              "real_day_missing_fill": None,
+                             "real_day_pnl_fifo": None,
                              "real_day_pnl_pertrade": None}
         _CACHE["ts"] = now
         _CACHE["day"] = day

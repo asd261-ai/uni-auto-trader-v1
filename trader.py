@@ -108,6 +108,13 @@ class AutoTrader:
 
     def _register_callbacks(self):
         self.api.dquote.on_tick_data_trade = self._on_tick
+        # Broker SDK (2026-06) began invoking on_tickdatabeforebidoffe (a bid/offer-pre
+        # tick callback, SDK-mis-spelled like on_disonnected below) on every quote
+        # message. The bot doesn't consume it, so with no handler the SDK raised
+        # AttributeError on every tick → pure log spam (179×/session 2026-06-25; the
+        # trade-tick feed was unaffected, last_tick_age stayed ~0s). Register a no-op to
+        # silence it. The attribute name must match exactly what the SDK getattr's.
+        self.api.dquote.on_tickdatabeforebidoffe = self._on_quote_noop
         self.api.dtrade.on_reply           = self._on_reply
         self.api.dtrade.on_match           = self._on_match
         self.api.dtrade.on_connected       = self._on_connected
@@ -162,6 +169,13 @@ class AutoTrader:
         return True
 
     # ── 事件回調 ──────────────────────────────────────────────────
+
+    def _on_quote_noop(self, *args, **kwargs):
+        """No-op for broker-SDK quote callbacks the bot does not consume (e.g. the
+        SDK-added on_tickdatabeforebidoffe bid/offer-pre tick). Accepts any signature so
+        the SDK never AttributeErrors; does nothing, so trade-tick handling via
+        on_tick_data_trade is unchanged. (2026-06-25)"""
+        pass
 
     def _on_tick(self, tick):
         logger.debug(f"Tick | {tick.commodityid} price={tick.matchprice} qty={tick.matchquantity} total={tick.matchtotalqty}")
