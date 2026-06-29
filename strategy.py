@@ -728,16 +728,39 @@ class MTXStrategy:
 
     def on_order_rejected(self, productid: str, bs: str, orderstatus: str):
         """Called from trader._on_reply (broker thread) when a reply is a rejection.
-        Roll back the optimistic unit so no phantom unit / phantom P&L lingers."""
+        Roll back the optimistic ENTRY unit, or — for a rejected EXIT (e.g. FUF0092
+        no-position) — clear its stale pend and book exit_fill=null now so it can't
+        poison the FIFO for the next fills."""
+        booked_exit = None
         with self._lock:
             unit = order_reject.rollback_rejected_entry(
                 self._pending_fills, self._units, productid, bs,
                 self.trader.config.get("product"),
             )
+            if unit is None:
+                pend = order_reject.rollback_rejected_exit(
+                    self._pending_fills, productid, bs,
+                    self.trader.config.get("product"),
+                )
+                if pend is not None:
+                    pe = pend.get("pe")
+                    if pe is not None and pe in self._pending_exit_records:
+                        self._pending_exit_records.remove(pe)
+                        rec = real_fill_pnl.finalize_exit(pe["record"], None, pe["record"]["dir_"])
+                        self._record_trade(**rec)
+                        self._save_pending_exit_records()
+                        booked_exit = rec
         if unit:
             logger.warning(
                 f"[order-rejected] source={unit['source']} dir={unit['dir']} "
                 f"id={unit['id']} status={orderstatus} → unit rolled back (no fill, no P&L)"
+            )
+        elif booked_exit is not None:
+            logger.warning(
+                f"[order-rejected] EXIT rejected status={orderstatus} "
+                f"src={booked_exit.get('source')} id={booked_exit.get('id')} "
+                f"reason={booked_exit.get('reason')} → pend cleared, exit_fill=null booked now "
+                f"(no 60s wait, FIFO unpoisoned)"
             )
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
