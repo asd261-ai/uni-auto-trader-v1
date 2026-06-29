@@ -86,7 +86,7 @@ ENTRY_PAST_TARGET_GUARD    = os.getenv("ENTRY_PAST_TARGET_GUARD", "1") == "1"
 # Cross-source opposite-direction collision guard (2026-06-29). Net-position account cannot
 # hold MTX-short + FVG-long in one contract — they net to broker-0 → FUF0092 close rejects +
 # null P&L rows. Modes: off (disabled) | observe (log WOULD-BLOCK, still trade) | on (skip).
-CROSS_SOURCE_OPP_MODE = os.environ.get("CROSS_SOURCE_OPP_MODE", "observe").strip().lower()
+CROSS_SOURCE_OPP_MODE = os.getenv("CROSS_SOURCE_OPP_MODE", "observe").strip().lower()
 REGIME_GATE_ENABLED        = os.getenv("REGIME_GATE_DOWNTREND_BLOCK", "0") == "1"
 REGIME_GATE_SMA_DAYS       = int(os.getenv("REGIME_GATE_SMA_DAYS", "20"))
 REGIME_GATE_SLOPE_DAYS     = int(os.getenv("REGIME_GATE_SLOPE_DAYS", "10"))
@@ -736,6 +736,7 @@ class MTXStrategy:
         no-position) — clear its stale pend and book exit_fill=null now so it can't
         poison the FIFO for the next fills."""
         booked_exit = None
+        cleared_only = False
         with self._lock:
             unit = order_reject.rollback_rejected_entry(
                 self._pending_fills, self._units, productid, bs,
@@ -754,6 +755,8 @@ class MTXStrategy:
                         self._record_trade(**rec)
                         self._save_pending_exit_records()
                         booked_exit = rec
+                    else:
+                        cleared_only = True
         if unit:
             logger.warning(
                 f"[order-rejected] source={unit['source']} dir={unit['dir']} "
@@ -765,6 +768,11 @@ class MTXStrategy:
                 f"src={booked_exit.get('source')} id={booked_exit.get('id')} "
                 f"reason={booked_exit.get('reason')} → pend cleared, exit_fill=null booked now "
                 f"(no 60s wait, FIFO unpoisoned)"
+            )
+        elif cleared_only:
+            logger.info(
+                f"[order-rejected] EXIT reject status={orderstatus} → stale pend cleared from FIFO "
+                f"(pe already booked/flushed, no re-book)"
             )
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
