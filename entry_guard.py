@@ -34,3 +34,27 @@ def entry_past_target(direction: str, price: Optional[float], target: Optional[f
     if direction == "short":
         return p <= t
     return False
+
+
+def cross_source_opposite(units, source: str, direction: str) -> bool:
+    """True ⇒ SKIP/observe: another strategy source already holds a position in the OPPOSITE
+    direction. In a net-position account both legs net to broker-0, then closes hit FUF0092
+    (no-position) and corrupt fill attribution. Same-direction cross-source is fine (it adds
+    lots), so it is NOT blocked.
+
+    Defensive: fail open (return False) on any malformed input — a guard must never halt
+    entries on bad state.
+    """
+    opposite = {"long": "short", "short": "long"}.get(direction)
+    if opposite is None:
+        return False
+    try:
+        for src, src_units in units.items():
+            if src == source or not src_units:
+                continue
+            for u in src_units:
+                if isinstance(u, dict) and u.get("dir") == opposite:
+                    return True
+    except (AttributeError, TypeError):
+        return False
+    return False
