@@ -22,7 +22,7 @@ from atr_gate import should_skip_code4_atr
 from demote_gate import should_demote
 from open_freeze import in_open_freeze_window
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
-from entry_guard import entry_past_target  # skip entries whose live fill is already past target (RR≤0)
+from entry_guard import entry_past_target, cross_source_opposite  # skip entries whose live fill is already past target (RR≤0)
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
 from pollloop_watchdog import PollLoopLivenessWatchdog
@@ -83,6 +83,10 @@ FVG_30M_REQUIRE_BIAS   = os.getenv("FVG_30M_REQUIRE_BIAS", "0") == "1"
 # 43017 → +6 real vs +214 signal-fiction). Default ON; all sources (MTX is a structural no-op).
 # Disable with .env ENTRY_PAST_TARGET_GUARD=0.
 ENTRY_PAST_TARGET_GUARD    = os.getenv("ENTRY_PAST_TARGET_GUARD", "1") == "1"
+# Cross-source opposite-direction collision guard (2026-06-29). Net-position account cannot
+# hold MTX-short + FVG-long in one contract — they net to broker-0 → FUF0092 close rejects +
+# null P&L rows. Modes: off (disabled) | observe (log WOULD-BLOCK, still trade) | on (skip).
+CROSS_SOURCE_OPP_MODE = os.environ.get("CROSS_SOURCE_OPP_MODE", "observe").strip().lower()
 REGIME_GATE_ENABLED        = os.getenv("REGIME_GATE_DOWNTREND_BLOCK", "0") == "1"
 REGIME_GATE_SMA_DAYS       = int(os.getenv("REGIME_GATE_SMA_DAYS", "20"))
 REGIME_GATE_SLOPE_DAYS     = int(os.getenv("REGIME_GATE_SLOPE_DAYS", "10"))
@@ -1918,6 +1922,23 @@ class MTXStrategy:
                       f"，RR 已失 → 不進場。id={trade.get('id')}",),
                 daemon=True).start()
             return
+
+        # Cross-source opposite-collision guard (2026-06-29). Block opening an opposite-dir
+        # position while another source holds one — the broker nets them to 0 and the close
+        # rejects (FUF0092). off→skip check; observe→log only; on→skip-absorb.
+        if place_order and CROSS_SOURCE_OPP_MODE != "off" and cross_source_opposite(
+                self._units, source, direction):
+            label = "加碼" if is_pyramid else "進場"
+            if CROSS_SOURCE_OPP_MODE == "on":
+                logger.warning(
+                    f"{source.upper()} {label} SKIPPED cross-source opposite collision | "
+                    f"dir={direction} id={trade.get('id')} (another source holds opposite; "
+                    f"net-account would reject the close)")
+                return
+            else:  # observe
+                logger.warning(
+                    f"[cross-opp OBSERVE] WOULD BLOCK {source.upper()} {label} {direction} "
+                    f"id={trade.get('id')} — another source holds opposite (still placing)")
 
         if place_order:
             if direction == "long":
