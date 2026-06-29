@@ -22,7 +22,7 @@ from atr_gate import should_skip_code4_atr
 from demote_gate import should_demote
 from open_freeze import in_open_freeze_window
 import fill_emit  # fill-anchoring (Plan B): report real entry fill → Worker /api/fill
-from entry_guard import entry_past_target  # skip entries whose live fill is already past target (RR≤0)
+from entry_guard import entry_past_target, cross_source_opposite  # skip entries whose live fill is already past target (RR≤0)
 from feed_schema import SCHEMA_FAIL, clean_feed
 from tick_watchdog import TickStaleWatchdog
 from pollloop_watchdog import PollLoopLivenessWatchdog
@@ -83,6 +83,10 @@ FVG_30M_REQUIRE_BIAS   = os.getenv("FVG_30M_REQUIRE_BIAS", "0") == "1"
 # 43017 → +6 real vs +214 signal-fiction). Default ON; all sources (MTX is a structural no-op).
 # Disable with .env ENTRY_PAST_TARGET_GUARD=0.
 ENTRY_PAST_TARGET_GUARD    = os.getenv("ENTRY_PAST_TARGET_GUARD", "1") == "1"
+# Cross-source opposite-direction collision guard (2026-06-29). Net-position account cannot
+# hold MTX-short + FVG-long in one contract — they net to broker-0 → FUF0092 close rejects +
+# null P&L rows. Modes: off (disabled) | observe (log WOULD-BLOCK, still trade) | on (skip).
+CROSS_SOURCE_OPP_MODE = os.getenv("CROSS_SOURCE_OPP_MODE", "observe").strip().lower()
 REGIME_GATE_ENABLED        = os.getenv("REGIME_GATE_DOWNTREND_BLOCK", "0") == "1"
 REGIME_GATE_SMA_DAYS       = int(os.getenv("REGIME_GATE_SMA_DAYS", "20"))
 REGIME_GATE_SLOPE_DAYS     = int(os.getenv("REGIME_GATE_SLOPE_DAYS", "10"))
@@ -210,6 +214,7 @@ FD_LEAK_SOFT      = int(os.getenv("FD_LEAK_SOFT", "800"))
 FD_LEAK_HARD      = int(os.getenv("FD_LEAK_HARD", "980"))
 FD_LEAK_CHECK_SEC = int(os.getenv("FD_LEAK_CHECK_SEC", "30"))
 FD_LEAK_GRACE_SEC = int(os.getenv("FD_LEAK_GRACE_SEC", "180"))
+FD_LEAK_HEARTBEAT_SEC = int(os.getenv("FD_LEAK_HEARTBEAT_SEC", "3600"))  # liveness heartbeat cadence (s); 0=off
 FD_LEAK_SOFT_KILL = os.getenv("FD_LEAK_SOFT_KILL", "on").lower() == "on"    # armed by default (flat restart benign)
 FD_LEAK_HARD_KILL = os.getenv("FD_LEAK_HARD_KILL", "off").lower() == "on"   # observe-first
 # Consecutive broker-read-unavailable (schema-drift or SDK timeout, both surface
@@ -416,6 +421,7 @@ class MTXStrategy:
             check_interval=FD_LEAK_CHECK_SEC,
             kill_grace=FD_LEAK_GRACE_SEC,
         )
+        self._fd_wd_last_hb = 0.0   # last fd-watchdog liveness heartbeat (monotonic)
 
         # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
         # order) so on_fill() attributes each Match to the right order even on
@@ -726,16 +732,47 @@ class MTXStrategy:
 
     def on_order_rejected(self, productid: str, bs: str, orderstatus: str):
         """Called from trader._on_reply (broker thread) when a reply is a rejection.
-        Roll back the optimistic unit so no phantom unit / phantom P&L lingers."""
+        Roll back the optimistic ENTRY unit, or — for a rejected EXIT (e.g. FUF0092
+        no-position) — clear its stale pend and book exit_fill=null now so it can't
+        poison the FIFO for the next fills."""
+        booked_exit = None
+        cleared_only = False
         with self._lock:
             unit = order_reject.rollback_rejected_entry(
                 self._pending_fills, self._units, productid, bs,
                 self.trader.config.get("product"),
             )
+            if unit is None:
+                pend = order_reject.rollback_rejected_exit(
+                    self._pending_fills, productid, bs,
+                    self.trader.config.get("product"),
+                )
+                if pend is not None:
+                    pe = pend.get("pe")
+                    if pe is not None and pe in self._pending_exit_records:
+                        self._pending_exit_records.remove(pe)
+                        rec = real_fill_pnl.finalize_exit(pe["record"], None, pe["record"]["dir_"])
+                        self._record_trade(**rec)
+                        self._save_pending_exit_records()
+                        booked_exit = rec
+                    else:
+                        cleared_only = True
         if unit:
             logger.warning(
                 f"[order-rejected] source={unit['source']} dir={unit['dir']} "
                 f"id={unit['id']} status={orderstatus} → unit rolled back (no fill, no P&L)"
+            )
+        elif booked_exit is not None:
+            logger.warning(
+                f"[order-rejected] EXIT rejected status={orderstatus} "
+                f"src={booked_exit.get('source')} id={booked_exit.get('id')} "
+                f"reason={booked_exit.get('reason')} → pend cleared, exit_fill=null booked now "
+                f"(no 60s wait, FIFO unpoisoned)"
+            )
+        elif cleared_only:
+            logger.info(
+                f"[order-rejected] EXIT reject status={orderstatus} → stale pend cleared from FIFO "
+                f"(pe already booked/flushed, no re-book)"
             )
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
@@ -898,6 +935,13 @@ class MTXStrategy:
                         is_flat=self._position_is_flat(),
                         on_kill=self._fd_wd_kill,
                     )
+                    # Liveness heartbeat: the watchdog is otherwise silent until a
+                    # threshold trip, so "no log" is ambiguous (low fd vs dead thread).
+                    # Throttled info line proves the thread is polling + shows fd trend.
+                    now_m = time.monotonic()
+                    if FD_LEAK_HEARTBEAT_SEC > 0 and now_m - self._fd_wd_last_hb >= FD_LEAK_HEARTBEAT_SEC:
+                        self._fd_wd_last_hb = now_m
+                        logger.info(f"[fd-wd alive] open_fds={fd_count} (soft={FD_LEAK_SOFT} hard={FD_LEAK_HARD})")
             except Exception as e:
                 logger.debug(f"fd-wd error (silent): {e}")
             time.sleep(FD_LEAK_CHECK_SEC)
@@ -1886,6 +1930,23 @@ class MTXStrategy:
                       f"，RR 已失 → 不進場。id={trade.get('id')}",),
                 daemon=True).start()
             return
+
+        # Cross-source opposite-collision guard (2026-06-29). Block opening an opposite-dir
+        # position while another source holds one — the broker nets them to 0 and the close
+        # rejects (FUF0092). off→skip check; observe→log only; on→skip-absorb.
+        if place_order and CROSS_SOURCE_OPP_MODE != "off" and cross_source_opposite(
+                self._units, source, direction):
+            label = "加碼" if is_pyramid else "進場"
+            if CROSS_SOURCE_OPP_MODE == "on":
+                logger.warning(
+                    f"{source.upper()} {label} SKIPPED cross-source opposite collision | "
+                    f"dir={direction} id={trade.get('id')} (another source holds opposite; "
+                    f"net-account would reject the close)")
+                return
+            else:  # observe
+                logger.warning(
+                    f"[cross-opp OBSERVE] WOULD BLOCK {source.upper()} {label} {direction} "
+                    f"id={trade.get('id')} — another source holds opposite (still placing)")
 
         if place_order:
             if direction == "long":
