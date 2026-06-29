@@ -210,6 +210,7 @@ FD_LEAK_SOFT      = int(os.getenv("FD_LEAK_SOFT", "800"))
 FD_LEAK_HARD      = int(os.getenv("FD_LEAK_HARD", "980"))
 FD_LEAK_CHECK_SEC = int(os.getenv("FD_LEAK_CHECK_SEC", "30"))
 FD_LEAK_GRACE_SEC = int(os.getenv("FD_LEAK_GRACE_SEC", "180"))
+FD_LEAK_HEARTBEAT_SEC = int(os.getenv("FD_LEAK_HEARTBEAT_SEC", "3600"))  # liveness heartbeat cadence (s); 0=off
 FD_LEAK_SOFT_KILL = os.getenv("FD_LEAK_SOFT_KILL", "on").lower() == "on"    # armed by default (flat restart benign)
 FD_LEAK_HARD_KILL = os.getenv("FD_LEAK_HARD_KILL", "off").lower() == "on"   # observe-first
 # Consecutive broker-read-unavailable (schema-drift or SDK timeout, both surface
@@ -416,6 +417,7 @@ class MTXStrategy:
             check_interval=FD_LEAK_CHECK_SEC,
             kill_grace=FD_LEAK_GRACE_SEC,
         )
+        self._fd_wd_last_hb = 0.0   # last fd-watchdog liveness heartbeat (monotonic)
 
         # Fill-anchoring (Plan B): FIFO of pending broker fills (entry+exit, in send
         # order) so on_fill() attributes each Match to the right order even on
@@ -898,6 +900,13 @@ class MTXStrategy:
                         is_flat=self._position_is_flat(),
                         on_kill=self._fd_wd_kill,
                     )
+                    # Liveness heartbeat: the watchdog is otherwise silent until a
+                    # threshold trip, so "no log" is ambiguous (low fd vs dead thread).
+                    # Throttled info line proves the thread is polling + shows fd trend.
+                    now_m = time.monotonic()
+                    if FD_LEAK_HEARTBEAT_SEC > 0 and now_m - self._fd_wd_last_hb >= FD_LEAK_HEARTBEAT_SEC:
+                        self._fd_wd_last_hb = now_m
+                        logger.info(f"[fd-wd alive] open_fds={fd_count} (soft={FD_LEAK_SOFT} hard={FD_LEAK_HARD})")
             except Exception as e:
                 logger.debug(f"fd-wd error (silent): {e}")
             time.sleep(FD_LEAK_CHECK_SEC)
