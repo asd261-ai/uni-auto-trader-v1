@@ -57,3 +57,31 @@ def rollback_rejected_entry(pending_fills: list, units: dict,
     if unit in src_units:
         src_units.remove(unit)
     return unit
+
+
+def rollback_rejected_exit(pending_fills: list, productid: str, bs: str,
+                           our_product: str) -> Optional[dict]:
+    """Undo a rejected EXIT (close) order whose broker order was rejected (e.g. FUF0092
+    no-position) so its pend stops poisoning the FIFO. The caller finalizes the pend's
+    deferred record to exit_fill=null immediately instead of waiting for the 60s timeout.
+
+    Conservative, ambiguity-averse (caller holds the strategy lock):
+      - ignore foreign contracts;
+      - if a same-side UNFILLED entry also pends, the reject may be for that entry → bail
+        (the entry-rollback path owns that case);
+      - candidates = pending EXIT orders on this side; act only when EXACTLY ONE, else bail
+        and leave drift to broker reconciliation.
+    Mutates pending_fills; returns the removed exit pend (carrying its 'pe'), or None.
+    """
+    if productid != our_product:
+        return None
+    if any(p.get("kind") == "entry" and p.get("bs") == bs
+           and p.get("unit", {}).get("entry_fill") is None for p in pending_fills):
+        return None
+    candidates = [p for p in pending_fills
+                  if p.get("kind") == "exit" and p.get("bs") == bs]
+    if len(candidates) != 1:
+        return None
+    pend = candidates[0]
+    pending_fills.remove(pend)
+    return pend

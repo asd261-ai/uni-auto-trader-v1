@@ -19,6 +19,10 @@ def _exit(bs):
     return {"kind": "exit", "bs": bs}
 
 
+def _exit_pe(bs, pe="PE"):
+    return {"kind": "exit", "bs": bs, "pe": pe}
+
+
 class IsRejectStatus(unittest.TestCase):
     def test_real_reject_codes_are_rejects(self):
         for s in ("FUF1239:同ID客戶未沖銷部位及委託保證金超過使用額度",
@@ -101,3 +105,49 @@ class RollbackRejectedEntry(unittest.TestCase):
 
     def test_empty_pending_is_noop(self):
         self.assertIsNone(orj.rollback_rejected_entry([], {"mtx": []}, "MXFF6", "S", "MXFF6"))
+
+
+class RollbackRejectedExit(unittest.TestCase):
+    def test_single_exit_removed_and_returned(self):
+        ex = _exit_pe("S")
+        pending = [ex]
+        got = orj.rollback_rejected_exit(pending, "MXFF6", "S", "MXFF6")
+        self.assertIs(got, ex)
+        self.assertEqual(pending, [])
+
+    def test_foreign_product_is_noop(self):
+        ex = _exit_pe("S")
+        pending = [ex]
+        self.assertIsNone(orj.rollback_rejected_exit(pending, "MXFG6", "S", "MXFF6"))
+        self.assertEqual(pending, [ex])
+
+    def test_bs_mismatch_is_noop(self):
+        ex = _exit_pe("B")
+        pending = [ex]
+        self.assertIsNone(orj.rollback_rejected_exit(pending, "MXFF6", "S", "MXFF6"))
+        self.assertEqual(pending, [ex])
+
+    def test_competing_same_bs_unfilled_entry_bails(self):
+        # Ambiguous: reject for "S" could be the close OR the unfilled short entry → bail.
+        u = _unit()
+        ex = _exit_pe("S")
+        pending = [ex, _entry(u, "S")]
+        self.assertIsNone(orj.rollback_rejected_exit(pending, "MXFF6", "S", "MXFF6"))
+        self.assertEqual(len(pending), 2)
+
+    def test_filled_competing_entry_does_not_block(self):
+        # A FILLED same-bs entry is not a reject candidate, so the exit is unambiguous.
+        u = _unit(entry_fill=46130)
+        ex = _exit_pe("S")
+        pending = [ex, _entry(u, "S")]
+        got = orj.rollback_rejected_exit(pending, "MXFF6", "S", "MXFF6")
+        self.assertIs(got, ex)
+        self.assertEqual(pending, [_entry(u, "S")])
+
+    def test_two_same_bs_exits_ambiguous_noop(self):
+        pending = [_exit_pe("S", "PE1"), _exit_pe("S", "PE2")]
+        self.assertIsNone(orj.rollback_rejected_exit(pending, "MXFF6", "S", "MXFF6"))
+        self.assertEqual(len(pending), 2)
+
+    def test_empty_pending_is_noop(self):
+        self.assertIsNone(orj.rollback_rejected_exit([], "MXFF6", "S", "MXFF6"))
