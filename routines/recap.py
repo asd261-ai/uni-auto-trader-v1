@@ -17,12 +17,14 @@ The deeper P&L comparison and bug-fix verification would need either:
   (b) a separate trader Telegram channel we can scrape via Bot API.
 For now, this script gives a coarse "did the trader respond to signals" check.
 """
-import json, re, urllib.request
+import json, os, re, sys, urllib.request
 from datetime import datetime, timezone, timedelta
 
-TOKEN = "Rkt9-TxQ4otAqM0TRKMtC4gSkJn7w4hy"
+TOKEN = os.environ.get("ASD261_API_TOKEN") or sys.exit(
+    "ASD261_API_TOKEN not set — export it in the routine's environment")
 TZ_TW = timezone(timedelta(hours=8))
-BOT   = "8886951190:AAGQ8fcMlni_JDJBzAzxdStFdEzlX17frs4"
+BOT = os.environ.get("HEALTH_BOT_TOKEN") or sys.exit(
+    "HEALTH_BOT_TOKEN not set — export it in the routine's environment")
 CHAT  = 6233009339
 
 
