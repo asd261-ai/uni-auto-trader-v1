@@ -15,3 +15,10 @@ fvg_state.json
 fvg_state.json.tmp
 mtx_state.json
 mtx_state.json.tmp
+analysis/candidate_early_read_*/
+analysis/daily_pnl/
+analysis/entry_quality/
+analysis/fill_anchor_stop/
+analysis/may_carry_vs_flat/
+analysis/retest_entry/
+analysis/reversed_churn/
