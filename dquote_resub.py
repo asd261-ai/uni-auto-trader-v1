@@ -31,9 +31,15 @@ class DquoteResubPolicy:
         # anti boot: don't act until past the uptime grace
         if uptime <= self.grace:
             return False
-        # feed healthy (tick-wd not alerting) -> episode over, re-arm
+        # feed healthy (tick-wd not alerting) -> episode over, re-arm fully:
+        # clear the cooldown stamp too, or a new episode starting within `cooldown`
+        # of the previous episode's last attempt gets its first attempt silently
+        # delayed. Re-alerting already implies >=90s of fresh staleness (tick-wd
+        # threshold) and trader.py holds its own min-interval guard, so the stale
+        # stamp adds no protection across episodes.
         if not alerting:
             self._attempts = 0
+            self._last_attempt = 0.0
             return False
         # stale episode: cap attempts, then defer to the tick-stale kill backstop
         if self._attempts >= self.max_attempts:

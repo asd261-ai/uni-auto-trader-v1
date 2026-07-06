@@ -53,6 +53,18 @@ class DquoteResubPolicyTests(unittest.TestCase):
         self.assertFalse(p.should_attempt(1400.0, alerting=False, uptime=999)) # feed recovered -> reset
         self.assertTrue(p.should_attempt(1500.0, alerting=True, uptime=999))   # new episode -> attempt
 
+    def test_new_episode_first_attempt_not_blocked_by_stale_cooldown(self):
+        # Episode boundary accounting: recovery must clear the cooldown stamp too,
+        # not just the attempt count. A new episode's FIRST attempt should fire
+        # immediately even if it lands within `cooldown` of the previous episode's
+        # last attempt — re-alerting already implies >=90s of fresh staleness plus
+        # the trader-level min-interval guard, so the stale stamp adds no
+        # protection, only delay. (Final-review Minor, 2026-06-23.)
+        p = make()
+        self.assertTrue(p.should_attempt(1000.0, alerting=True, uptime=999))   # episode 1 attempt
+        self.assertFalse(p.should_attempt(1010.0, alerting=False, uptime=999)) # recovered -> episode over
+        self.assertTrue(p.should_attempt(1030.0, alerting=True, uptime=999))   # new episode, 30s < cooldown 60
+
 
 if __name__ == "__main__":
     unittest.main()
