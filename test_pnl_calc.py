@@ -131,6 +131,19 @@ class BotOrdernosTest(unittest.TestCase):
                 _reply("2026-06-18T10:00:00+08:00", "QN001", pid="MXFH6")]
         self.assertEqual(bot_ordernos(rows), set())
 
+    def test_duplicate_replies_do_not_shadow_second_order(self):
+        # Real incident 2026-07-06 13:24:35 (reverse: close-long + open-short, both S):
+        # broker emitted TWO reply events per orderno. The second sent claimed 0I934's
+        # duplicate reply, leaving 0I935 unclaimed -> its fill dropped from FIFO ->
+        # PNL_DIVERGENCE cascade (orders-FIFO +102 vs per-trade -310).
+        rows = [_sent("2026-07-06T13:24:34+08:00", bs="S"),
+                _sent("2026-07-06T13:24:34+08:00", bs="S"),
+                _reply("2026-07-06T13:24:34+08:00", "0I934", bs="S"),
+                _reply("2026-07-06T13:24:35+08:00", "0I934", bs="S"),
+                _reply("2026-07-06T13:24:35+08:00", "0I935", bs="S"),
+                _reply("2026-07-06T13:24:35+08:00", "0I935", bs="S")]
+        self.assertEqual(bot_ordernos(rows), {"0I934", "0I935"})
+
 
 from pnl_calc import realized_day_pts
 

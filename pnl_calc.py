@@ -63,6 +63,11 @@ def bot_ordernos(rows):
     _LINK_WINDOW_SEC seconds sharing productid + bs. Manual/non-bot fills have no
     'sent' and are therefore excluded. See provenance design 2026-06-19."""
     sents, replies = [], []
+    # Broker emits multiple reply events per order; only the first per orderno may
+    # claim a 'sent', or a duplicate shadows the next order's reply (2026-07-06
+    # reverse incident). Assumes ordernos are unique across the whole orders.jsonl
+    # lifetime — the same assumption the bot-set membership check already makes.
+    seen_reply_onos = set()
     for r in rows:
         ev = r.get("event")
         ts = _parse_iso(r.get("ts"))
@@ -70,7 +75,8 @@ def bot_ordernos(rows):
             continue
         if ev == "sent":
             sents.append((ts, r.get("productid"), r.get("bs")))
-        elif ev == "reply" and r.get("orderno"):
+        elif ev == "reply" and r.get("orderno") and r.get("orderno") not in seen_reply_onos:
+            seen_reply_onos.add(r.get("orderno"))
             replies.append((ts, r.get("productid"), r.get("bs"), r.get("orderno")))
     sents.sort(key=lambda x: x[0])
     replies.sort(key=lambda x: x[0])
