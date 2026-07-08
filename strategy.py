@@ -556,6 +556,10 @@ class MTXStrategy:
         t = threading.Thread(target=self._poll_loop, daemon=True)
         t.start()
         threading.Thread(target=self._pollloop_wd_loop, daemon=True).start()
+        # Boot log so a post-restart journal grep can confirm armed state directly
+        # (env flags are invisible in journalctl otherwise — 2026-07-08 arm lesson).
+        logger.info(f"[pollloop-wd] started | freeze_kill={'ARMED' if POLLLOOP_FREEZE_KILL else 'observe'} | "
+                    f"freeze={POLLLOOP_FREEZE_SEC}s check={POLLLOOP_FREEZE_CHECK_SEC}s grace={POLLLOOP_FREEZE_GRACE_SEC}s")
         threading.Thread(target=self._fd_wd_loop, daemon=True).start()
         logger.info(f"MTXStrategy started | dry_run={self.dry_run} | poll={POLL_INTERVAL}s | "
                     f"sources={[s['source'] for s in SIGNAL_SOURCES]} | fvg_mode={FVG_OBSERVE_MODE} | "

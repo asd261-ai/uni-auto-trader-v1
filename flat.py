@@ -25,6 +25,7 @@ import sys
 import time
 import requests
 import logging
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from config import CONFIG
 from flat_query import UNKNOWN, query_net
@@ -35,6 +36,7 @@ load_dotenv()
 
 
 def send_tg(token: str, chat_id: str, text: str):
+    text = f"{text}\n🕐 TW {datetime.now(timezone(timedelta(hours=8))).strftime('%m/%d %H:%M')}"
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",

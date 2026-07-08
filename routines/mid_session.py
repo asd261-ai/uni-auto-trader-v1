@@ -21,6 +21,9 @@ def get(url, auth=True):
 
 
 def send_telegram(text, parse_mode="HTML"):
+    # Marker guard: the no-parse_mode retry re-enters with the stamped text.
+    if "🕐 TW" not in text:
+        text = f"{text}\n🕐 TW {datetime.now(TZ_TW).strftime('%m/%d %H:%M')}"
     payload = {"chat_id": CHAT, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode

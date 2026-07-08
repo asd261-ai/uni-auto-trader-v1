@@ -1,10 +1,21 @@
 import logging
 import time
+from datetime import datetime, timedelta, timezone
+
 import requests
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+
+# Taiwan has no DST, so a fixed +8 offset is exact and avoids any tzdata
+# dependency inside the deploy container. Sean reads alerts across time zones —
+# every message carries the market's clock.
+_TW_TZ = timezone(timedelta(hours=8))
+
+
+def _tw_stamp() -> str:
+    return datetime.now(_TW_TZ).strftime("%m/%d %H:%M")
 
 # Retry network blips and 429s — entry/exit messages are time-sensitive but
 # losing one is bad UX. 4xx (bad token, bad chat, bad HTML) won't recover so we don't retry.
@@ -15,6 +26,8 @@ def send(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
         logger.warning("Telegram not configured — skipping notification")
         return False
+
+    text = f"{text}\n🕐 TW {_tw_stamp()}"
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
