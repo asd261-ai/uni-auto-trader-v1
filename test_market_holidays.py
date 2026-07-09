@@ -19,6 +19,14 @@ class HolidayCalendarTest(unittest.TestCase):
         for iso in ("2026-01-01", "2026-02-17", "2026-06-19", "2026-09-25", "2026-12-25"):
             self.assertTrue(is_market_holiday(date.fromisoformat(iso)), iso)
 
+    def test_typhoon_adhoc_closure_2026_07_10(self):
+        # Ad-hoc typhoon closure (announced 7/9 evening). 7/10 day+night halted;
+        # the 7/9 eve night session's dawn tail (7/10 00:00-05:00) stays active via
+        # the prev-day tail check in _get_session, which this calendar must NOT block.
+        self.assertFalse(is_trading_day(date(2026, 7, 10)))   # Fri typhoon closure
+        self.assertTrue(is_trading_day(date(2026, 7, 9)))     # eve is a normal trading day
+        self.assertTrue(is_trading_day(date(2026, 7, 13)))    # Mon reopen (assuming typhoon passed)
+
     def test_non_holidays_not_flagged(self):
         for iso in ("2026-06-18", "2026-06-22", "2026-02-23", "2026-09-24"):
             self.assertFalse(is_market_holiday(date.fromisoformat(iso)), iso)

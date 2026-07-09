@@ -39,6 +39,8 @@ TW_MARKET_HOLIDAYS = frozenset({
     "2026-04-06",  # 清明連假補假 (Mon)
     "2026-05-01",  # 勞動節 (Fri)
     "2026-06-19",  # 端午節 (Fri)
+    "2026-07-10",  # 颱風假 (Fri; ad-hoc typhoon closure announced 7/9 — day+night halted;
+                   #   7/9 eve night session ran normally to 7/10 05:00 per TAIFEX practice)
     "2026-09-25",  # 中秋節 (Fri)
     "2026-09-28",  # 教師節 (Mon)
     "2026-10-09",  # 國慶日補假 (Fri; 10/10 Sat)
