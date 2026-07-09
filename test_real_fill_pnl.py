@@ -63,6 +63,19 @@ class FinalizeExit(unittest.TestCase):
         self.assertIsNone(rec["exit_fill"])
         self.assertIsNone(rec["pnl_pts_real"])
 
+    def test_no_echo_flush_stamps_fill_timeout_flag(self):
+        # Downstream analyses filter nofill rows with one explicit key instead of
+        # reverse-engineering the null signature (2026-07-09 dirty-fill study).
+        rec = self._record(entry_fill=46100)
+        rfp.finalize_exit(rec, None, "long")
+        self.assertIs(rec.get("fill_timeout"), True)
+
+    def test_real_fill_does_not_stamp_fill_timeout(self):
+        # A normally-filled exit must NOT carry the flag (absent, not False).
+        rec = self._record(entry_fill=46100)
+        rfp.finalize_exit(rec, 46160, "long")
+        self.assertNotIn("fill_timeout", rec)
+
     def test_mutates_in_place_and_returns_same_object(self):
         rec = self._record()
         self.assertIs(rfp.finalize_exit(rec, 46160, "long"), rec)

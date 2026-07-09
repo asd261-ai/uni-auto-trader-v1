@@ -18,6 +18,7 @@ from market_holidays import is_trading_day
 from margin_headroom import headroom_low
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
+from exit_sanity import sane_exit_price  # defense-in-depth vs Worker exit-price pollution (6/30)
 from atr_gate import should_skip_code4_atr
 from demote_gate import should_demote
 from open_freeze import in_open_freeze_window
@@ -220,6 +221,11 @@ FD_LEAK_HARD_KILL = os.getenv("FD_LEAK_HARD_KILL", "off").lower() == "on"   # ob
 # Consecutive broker-read-unavailable (schema-drift or SDK timeout, both surface
 # as SCHEMA_FAIL from _query_broker_position) streak before a Health-bot alert.
 SDK_READ_TIMEOUT_ALERT_N  = int(os.getenv("SDK_READ_TIMEOUT_ALERT_N", "3"))
+
+# Max plausible distance (pts) between our entry and a Worker-supplied profit exit
+# price. Beyond this the price is treated as polluted (6/30 fill_anchor incident
+# wrote tiny slip-deltas here) and the exit books at entry (≈0 pnl) with a warning.
+EXIT_SANITY_MAX_PTS = int(os.getenv("EXIT_SANITY_MAX_PTS", "1000"))
 
 # Settlement-day awareness: on the 3rd Wednesday the front contract settles at 13:30,
 # so 13:30-15:00 has no ticks and any held position is gone. _get_session returns
@@ -978,7 +984,8 @@ class MTXStrategy:
 
     def _record_trade(self, *, source: str, label: str, dir_: str, entry, exit_price,
                        stop, target, pnl_pts: float, reason: str, sig_id, opened_at_ms,
-                       entry_fill=None, exit_fill=None, pnl_pts_real=None):
+                       entry_fill=None, exit_fill=None, pnl_pts_real=None,
+                       fill_timeout=False):
         """Append one trade record to trades.jsonl AND update monthly counters.
 
         Called from _close_unit for every closed unit regardless of source.
@@ -1010,6 +1017,10 @@ class MTXStrategy:
                 "reason":       reason,
                 "duration_sec": duration_sec,
             }
+            if fill_timeout:
+                # Explicit key (absent otherwise) so downstream analyses filter
+                # no-echo nofill rows without reverse-engineering the null signature.
+                record["fill_timeout"] = True
             with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             # Cloud backup (Worker /api/trade_log, Worker 端 dedup by (id, reason))
@@ -1823,6 +1834,13 @@ class MTXStrategy:
                     meta_exit = (our_trade.get("meta") or {}).get("exit_price")
                     if meta_exit is not None:
                         exit_price = meta_exit
+                    exit_price, sane = sane_exit_price(
+                        exit_price, unit.get("entry"), EXIT_SANITY_MAX_PTS)
+                    if not sane:
+                        logger.warning(
+                            f"[exit-sanity] Worker profit exit price implausible "
+                            f"(>|{EXIT_SANITY_MAX_PTS}pt| from entry={unit.get('entry')}) "
+                            f"source={source} id={unit['id']} → booking at entry (≈0 pnl)")
                     logger.info(f"Worker exit (profit) | source={source} id={unit['id']}")
                     self._close_unit(unit, "profit", exit_price=exit_price)
 

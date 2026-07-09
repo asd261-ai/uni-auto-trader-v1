@@ -17,10 +17,15 @@ def finalize_exit(record: Dict[str, Any], exit_fill, dir_: str) -> Dict[str, Any
     """Stamp exit_fill + pnl_pts_real onto a deferred trade record, in place.
     Direction is passed EXPLICITLY (callers use varying record key names, e.g.
     strategy's record_kwargs uses 'dir_') so the P&L sign never silently depends on a
-    dict-key match. exit_fill=None (timeout flush) → pnl_pts_real stays None. Intended
+    dict-key match. exit_fill=None (no broker echo: timeout flush, rejected exit, or
+    boot flush) → pnl_pts_real stays None AND the record is stamped fill_timeout=True
+    so downstream analyses filter nofill rows on one explicit key instead of
+    reverse-engineering the null signature (2026-07-09 dirty-fill study). Intended
     to be called once per record (a second call overwrites the stamped values)."""
     record["exit_fill"] = exit_fill
     record["pnl_pts_real"] = compute_pnl_pts_real(dir_, record.get("entry_fill"), exit_fill)
+    if exit_fill is None:
+        record["fill_timeout"] = True
     return record
 
 
