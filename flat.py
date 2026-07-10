@@ -21,6 +21,7 @@
 也可能要手動緊急平,所以需要可指定方向的工具。trader.py 已記錄每筆 broker reply
 到 orders.jsonl,這個腳本平倉時 broker 回報會走獨立 callback,不會污染 audit log。
 """
+import os
 import sys
 import time
 import requests
@@ -29,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from config import CONFIG
 from flat_query import UNKNOWN, query_net
+from order_guard import assert_order_allowed
 from unitrade.unitrade import Unitrade, DOrderObject
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -73,6 +75,9 @@ if not query_mode:
     if confirm != "y":
         print("Cancelled.")
         sys.exit(0)
+    # Human confirmation received — satisfy the order_guard contract (BOARD T010)
+    # for this process. Set ONLY after the explicit y above, never at import time.
+    os.environ["TRADER_MANUAL_ORDER_ACK"] = "1"
 
 # ── 連線 ──
 api = Unitrade()
@@ -122,6 +127,7 @@ order.opencloseflag  = "1"     # close
 order.dtrade         = "N"
 
 print(f"Sending {bs_arg} {qty_arg} {CONFIG['product']} market close ...")
+assert_order_allowed()  # fails closed if the confirm above was ever bypassed (T010)
 order_resp = api.dtrade.order(order)
 print(f"issend={order_resp.issend} seq={order_resp.seq} err={order_resp.errormsg}")
 

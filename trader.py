@@ -3,6 +3,7 @@ import logging
 import os
 from unitrade.unitrade import Unitrade, DOrderObject, DReplaceObject
 import order_log
+import order_guard  # process-level live-order gate (BOARD T010, 7/10 near-miss class fix)
 from feed_schema import parse_broker_position, parse_fill, SCHEMA_FAIL
 from order_reject import is_reject_status
 from sdk_timeout import call_with_timeout, SDKCallTimeout
@@ -345,6 +346,16 @@ class AutoTrader:
         return resp
 
     def _send_order(self, productid: str, bs: str, qty: int, ordertype: str, price: float, opencloseflag: str = ""):
+        # Process identity gate: only the systemd service (TRADER_SERVICE=1, unit
+        # file only) or an explicitly-acked human may send live orders. Degrade to
+        # the existing rejection path (issend=False) so the poll loop stays alive.
+        try:
+            order_guard.assert_order_allowed()
+        except order_guard.OrderGuardError as e:
+            logger.critical(f"[order-guard] BLOCKED order send | {productid} {bs} x{qty}: {e}")
+            order_log.log_event("guard_blocked", productid=productid, bs=bs, qty=qty,
+                                ordertype=ordertype, price=price, opencloseflag=opencloseflag)
+            return order_guard.GuardRejectedResp(str(e))
         order = DOrderObject()
         order.actno = self.actno
         order.productid = productid
