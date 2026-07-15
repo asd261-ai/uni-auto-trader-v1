@@ -1468,10 +1468,13 @@ class MTXStrategy:
         re-locks immediately; it clears at 08:45 when _check_trading_day_reset
         flips the flag and pnl_calc's day window slides to the new day.
         Fail-open on a transient None read (leave lock state unchanged).
-        Scope is the bot's resolved contract only (config["product"], e.g. MXFF6):
-        the shared broker account also logs Sean's MANUAL trades in other months
-        (e.g. MXFG6) into orders.jsonl — those must NOT trip the bot's lock.
-        (FVG runs paper, never hits orders.jsonl.)
+        Scope is provenance-based, not contract-name-based: pnl_calc traces each
+        fill back through the bot's own sent→reply(orderno)→match event chain
+        (bot_ordernos) to confirm it originated from this bot before counting it.
+        The shared broker account also logs Sean's MANUAL trades into orders.jsonl
+        (same or other months) — those lack bot provenance and are excluded, so
+        they must NOT trip the bot's lock. See docs/superpowers/specs/2026-06-19-
+        pnl-provenance-fifo-design.md. (FVG runs paper, never hits orders.jsonl.)
         """
         if DAILY_MAX_LOSS_PTS is None or self._trading_day_locked:
             return
