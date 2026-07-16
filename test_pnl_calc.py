@@ -225,6 +225,73 @@ class RealizedDayPtsTest(unittest.TestCase):
         self.assertEqual(realized_day_pts([], self.start, self.end), (0.0, 0))
 
 
+class RealizedDayPtsCarryTest(unittest.TestCase):
+    """2026-07-16 fix: a position opened in the PREVIOUS trading-day window and
+    closed after 08:45 must pair with its real open leg (bounded carry lookback),
+    not be mis-read as a fresh open that corrupts the whole day's FIFO
+    (orders-FIFO -373 vs broker/per-trade -153 on 2026-07-16)."""
+
+    def setUp(self):
+        # trading day 2026-07-16: window 07-16 08:45 → 07-17 08:45
+        self.start, self.end = _trading_day_window("2026-07-16")
+
+    @staticmethod
+    def _leg(ts, ono, bs, price, pid="MXFH6"):
+        return [_sent(ts, pid=pid, bs=bs), _reply(ts, ono, pid=pid, bs=bs),
+                _match(ts, ono, bs, price, pid=pid)]
+
+    def _carry_rows(self):
+        # night-session buy at 03:48 (belongs to trading day 07-15) carried
+        # across 08:45, stopped out 08:50 — the real 2026-07-16 incident shape.
+        return (self._leg("2026-07-16T03:48:19+08:00", "C1", "B", 45823.0)
+                + self._leg("2026-07-16T08:50:00+08:00", "C2", "S", 45531.0))
+
+    def test_carry_across_0845_boundary_pairs_with_real_open_leg(self):
+        pts, trips = realized_day_pts(self._carry_rows(), self.start, self.end)
+        self.assertEqual(pts, -292.0)   # 45531 - 45823, the broker-true loss
+        self.assertEqual(trips, 1)
+
+    def test_carry_close_does_not_cascade_into_day_trades(self):
+        # After the carried close, the day's own round-trips must pair cleanly
+        # (the old mis-pairing corrupted every later pair: -373 vs true -182 here).
+        rows = (self._carry_rows()
+                + self._leg("2026-07-16T09:01:36+08:00", "D1", "S", 45622.0)
+                + self._leg("2026-07-16T09:02:31+08:00", "D2", "B", 45553.0)
+                + self._leg("2026-07-16T09:04:43+08:00", "D3", "S", 45561.0)
+                + self._leg("2026-07-16T09:07:44+08:00", "D4", "B", 45520.0))
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, -182.0)   # -292 + 69 + 41
+        self.assertEqual(trips, 3)
+
+    def test_carry_roundtrip_not_double_counted_on_prior_day(self):
+        # The same round-trip queried for trading day 07-15 realizes NOTHING there
+        # (its close is outside that window) — no double count across days.
+        prev_start, prev_end = _trading_day_window("2026-07-15")
+        pts, trips = realized_day_pts(self._carry_rows(), prev_start, prev_end)
+        self.assertEqual(pts, 0.0)
+        self.assertEqual(trips, 0)
+
+    def test_prior_day_completed_roundtrip_not_counted_today(self):
+        # A round-trip fully inside the previous trading day contributes zero today
+        # even though its fills now sit inside the carry-lookback scan range.
+        rows = (self._leg("2026-07-15T16:00:00+08:00", "P1", "B", 46100.0)
+                + self._leg("2026-07-15T16:30:00+08:00", "P2", "S", 46150.0)
+                + self._leg("2026-07-16T10:00:00+08:00", "T1", "B", 45600.0)
+                + self._leg("2026-07-16T10:30:00+08:00", "T2", "S", 45650.0))
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 50.0)     # today's +50 only; yesterday's +50 excluded
+        self.assertEqual(trips, 1)
+
+    def test_leg_older_than_lookback_still_ignored(self):
+        # Stale-leg protection keeps its bound: an unmatched leg older than the
+        # carry lookback must NOT absorb today's close (the +2176 regression class).
+        rows = (self._leg("2026-07-05T10:00:00+08:00", "OLD", "B", 43946.0)
+                + self._leg("2026-07-16T10:00:00+08:00", "N1", "S", 45650.0))
+        pts, trips = realized_day_pts(rows, self.start, self.end)
+        self.assertEqual(pts, 0.0)      # lone in-window S stays open, no pairing
+        self.assertEqual(trips, 0)
+
+
 from pnl_calc import divergence_warn
 
 

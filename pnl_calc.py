@@ -197,19 +197,36 @@ def _fifo(fills):
     return closed, pos
 
 
+# How far before the window start the FIFO scan may reach to find the open leg of a
+# position carried across 08:45. 5 days covers a weekend + holiday cluster; anything
+# older is treated as stale (the +2176 regression class), and conservative_day_pnl's
+# min() remains the backstop for whatever this bound misses.
+_CARRY_LOOKBACK_DAYS = 5
+
+
 def realized_day_pts(rows, start, end):
-    """(realized_points, round_trips) from bot match fills inside [start, end),
-    FIFO'd per EXACT contract. Provenance (bot_ordernos) drops manual/non-bot
-    fills; the window drops stale prior-day legs; per-product grouping prevents
-    cross-contract pairing on a settlement-day rollover. Open legs stay open
-    (unrealized, not counted)."""
+    """(realized_points, round_trips) realized inside [start, end), FIFO'd per
+    EXACT contract over bot match fills. Provenance (bot_ordernos) drops
+    manual/non-bot fills; per-product grouping prevents cross-contract pairing
+    on a settlement-day rollover. Open legs stay open (unrealized, not counted).
+
+    2026-07-16 carry fix: fills are scanned from _CARRY_LOOKBACK_DAYS before
+    `start` so a position opened in the previous trading day and closed after
+    08:45 pairs with its REAL open leg, but a round-trip only counts toward the
+    result when its CLOSING fill lands inside [start, end) — prior-day
+    round-trips realize nothing today, and legs older than the lookback stay
+    excluded (stale-leg protection keeps a hard bound). Before this fix the
+    window-filtered open leg made the in-window close mis-pair as a fresh open,
+    corrupting every later pair (2026-06-24 +382 vs broker −421; 2026-07-16
+    −373 vs broker −153)."""
+    scan_start = start - timedelta(days=_CARRY_LOOKBACK_DAYS)
     bot = bot_ordernos(rows)
     by_pid = {}
     for r in rows:
         if r.get("event") != "match" or r.get("orderno") not in bot:
             continue
         ts = _parse_iso(r.get("ts"))
-        if ts is None or not (start <= ts < end):
+        if ts is None or not (scan_start <= ts < end):
             continue
         bs = r.get("bs")
         price = r.get("matchprice")
@@ -223,8 +240,10 @@ def realized_day_pts(rows, start, end):
     for fills in by_pid.values():
         fills.sort(key=lambda x: x[0])
         closed, _open = _fifo(fills)
-        total += sum(pnl for _ts, pnl in closed)
-        trips += len(closed)
+        for close_ts, pnl in closed:
+            if start <= close_ts < end:
+                total += pnl
+                trips += 1
     return round(total, 1), trips
 
 
