@@ -95,6 +95,7 @@ def bot_ordernos(rows):
 
 _TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.jsonl")
 _STATE_PATH = os.path.join(os.path.dirname(__file__), "mtx_state.json")
+_FVG_STATE_PATH = os.path.join(os.path.dirname(__file__), "fvg_state.json")
 _CACHE = {"ts": 0.0, "val": None, "day": None}
 _CACHE_SEC = 30
 
@@ -303,6 +304,20 @@ def _real_open() -> str:
         return "flat"
 
 
+def _bot_is_flat() -> bool:
+    """True when the bot holds no open units in EITHER source — mtx_state.json
+    (mtx_units) AND fvg_state.json (fvg_units). An FVG-only position must not
+    count as flat. Unreadable state counts as flat (fail-open toward evaluating
+    the divergence check, matching _real_open()'s exception → "flat")."""
+    if _real_open() != "flat":
+        return False
+    try:
+        with open(_FVG_STATE_PATH, encoding="utf-8") as f:
+            return not (json.load(f).get("fvg_units") or [])
+    except Exception:
+        return True
+
+
 def _compute(base=None):
     td = _today_trading_day()
     xcheck = summarize_real_pnl(_read_trades(), td)   # per-trade sum + month + missing
@@ -312,7 +327,7 @@ def _compute(base=None):
     except Exception:
         day_pnl, day_trades = None, None              # fail-open: breaker sees no-data
     if divergence_warn(day_pnl, xcheck["real_trading_day_pnl_pts"],
-                       xcheck["real_day_missing_fill"]):
+                       xcheck["real_day_missing_fill"], is_flat=_bot_is_flat()):
         _log.warning("PNL_DIVERGENCE: orders-FIFO=%s vs per-trade=%s (missing_fill=0) "
                      "— check provenance/data", day_pnl, xcheck["real_trading_day_pnl_pts"])
     # Canonical P&L for the loss breaker + 📈 display = the more-pessimistic of the two
@@ -338,11 +353,19 @@ def _compute(base=None):
 _DIVERGENCE_TOL_PTS = 1.0
 
 
-def divergence_warn(fifo_pts, pertrade_pts, missing_fill):
+def divergence_warn(fifo_pts, pertrade_pts, missing_fill, is_flat=True):
     """True when the authoritative orders-FIFO value and the per-trade pnl_pts_real
     sum disagree by more than _DIVERGENCE_TOL_PTS with ZERO missing fills — a
     disagreement not explained by unstamped exits, so a provenance/data smell worth
-    a log line. Never blocks the breaker."""
+    a log line. Never blocks the breaker.
+
+    Flat-gated (2026-07-18): while positions are open the two engines legitimately
+    diverge (overlapping-position attribution transient, e.g. 2026-07-17
+    13:21–13:28) and reconverge at flat — so only evaluate when is_flat. Both
+    known true positives (2026-06-24, 2026-07-16) still diverged AT flat, so the
+    gate loses no real detections. Log-timing only; canonical min() is untouched."""
+    if not is_flat:
+        return False
     if fifo_pts is None or pertrade_pts is None:
         return False
     if missing_fill != 0:

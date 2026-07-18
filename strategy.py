@@ -15,7 +15,7 @@ import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no exec
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state, load_mtx_product, rolled_over
 from settlement_calendar import is_settlement_window
 from market_holidays import is_trading_day
-from margin_headroom import headroom_low
+from margin_headroom import headroom_low, read_failure_alert_due
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
 from exit_sanity import sane_exit_price  # defense-in-depth vs Worker exit-price pollution (6/30)
@@ -179,6 +179,11 @@ RECON_ALERT_AGE_SEC      = 180  # mismatch must persist > 3 min before alerting
 # (DMargin.twdordexcess) drops below the floor the bot needs to keep placing
 # MXF orders (FUF1239 rejection threshold). 0 disables (no redeploy needed).
 MARGIN_HEADROOM_MIN_TWD = float(os.getenv("MARGIN_HEADROOM_MIN_TWD", "100000"))
+# Escalate once after N consecutive failed margin reads in an active session — a
+# query outage must not be invisible (2026-07-17 night: debug-only → whole-night
+# silence exactly while margin starved). ~1 read/min → 10 ≈ 10 minutes blind.
+# 0 disables (no redeploy needed).
+MARGIN_READ_FAIL_ALERT_N = int(os.getenv("MARGIN_READ_FAIL_ALERT_N", "10"))
 
 # Tick-stale watchdog: detect when the dquote tick feed silently stops (alive but blind).
 TICK_STALE_DAY_SEC      = int(os.getenv("TICK_STALE_DAY_SEC", "90"))     # liquid day session
@@ -387,6 +392,7 @@ class MTXStrategy:
         # Shared-account margin headroom monitor (alert-only, never touches orders)
         self._margin_last_check:     float                  = 0.0    # epoch s of last get_margin
         self._margin_alert_sent:     bool                   = False  # one-shot dedup latch
+        self._margin_read_fail_streak: int                  = 0      # consecutive failed margin reads
 
         # Tick-stale watchdog: detect when the dquote tick feed silently stops delivering
         # (trader alive but blind to price → exits won't fire). Alert-only; see tick_watchdog.py.
@@ -784,6 +790,21 @@ class MTXStrategy:
                 f"[order-rejected] EXIT reject status={orderstatus} → stale pend cleared from FIFO "
                 f"(pe already booked/flushed, no re-book)"
             )
+        # Margin-family reject → immediate Health-bot alert. The reject reply is the
+        # broker itself reporting starvation, so it must not depend on the polling
+        # margin query succeeding (2026-07-17 night: query failed all night → watcher
+        # silent while four PSC0019 rejects sat in the log). Reuses the headroom
+        # latch: one alert per starvation episode, no 4-rejects-4-messages burst, and
+        # the existing recovery notify closes the loop once the query reads healthy.
+        if order_reject.is_margin_reject(orderstatus) and not self._margin_alert_sent:
+            self._margin_alert_sent = True
+            status_clean = (orderstatus or "").strip()
+            logger.warning(f"MARGIN_REJECT_ALERT: {productid} {bs} status={status_clean}")
+            threading.Thread(target=self._safe_health_notify, args=(
+                f"⚠️ <b>下單被拒:保證金不足</b>\n"
+                f"{productid} {bs} 拒單 <code>{status_clean}</code>\n"
+                f"共用帳號 margin 枯竭,bot 新單將持續被拒。\n"
+                f"請入金或減少手動部位以恢復 headroom。",), daemon=True).start()
 
     # ── Poll 迴圈 ─────────────────────────────────────────────────
 
@@ -838,7 +859,7 @@ class MTXStrategy:
             try:
                 self._check_margin_headroom()
             except Exception as e:
-                logger.debug(f"margin headroom error (silent): {e}")
+                logger.info(f"margin headroom error (non-fatal): {e}")
             # Tick-stale watchdog: detect if the dquote feed goes silent during an active
             # session (self-throttled + session/weekend-gated inside check()).
             # PHASE 1 (observe-only): route alerts to the log, NOT Telegram — validates
@@ -1397,9 +1418,30 @@ class MTXStrategy:
 
         excess = self.trader._query_broker_margin_excess("TWD")
         if excess is None:
-            # No reliable read — fail-safe, do NOT alert and do NOT clear latch.
-            logger.debug("margin headroom: no reliable read this cycle")
+            # No reliable read — fail-safe: never alert LOW on ambiguity, don't clear
+            # the latch. But a long outage must not be invisible (2026-07-17 night:
+            # debug-only → whole-night silence exactly while margin starved — the
+            # query fails most easily exactly when the account is most starved):
+            # count consecutive failures and escalate once at the threshold.
+            self._margin_read_fail_streak += 1
+            logger.info(f"margin headroom: no reliable read this cycle "
+                        f"(streak={self._margin_read_fail_streak})")
+            if read_failure_alert_due(self._margin_read_fail_streak, MARGIN_READ_FAIL_ALERT_N):
+                logger.warning(
+                    f"MARGIN_READ_FAIL: {self._margin_read_fail_streak} consecutive "
+                    f"failed margin reads — headroom monitoring blind"
+                )
+                self._safe_health_notify(
+                    f"⚠️ <b>保證金查詢連續失敗</b>\n"
+                    f"連續 {self._margin_read_fail_streak} 次讀不到可用保證金,"
+                    f"headroom 監控失明中。\n"
+                    f"若同時看到拒單告警,margin 大概率已枯竭。"
+                )
             return
+        if self._margin_read_fail_streak:
+            logger.info(f"margin headroom: read recovered after "
+                        f"{self._margin_read_fail_streak} failed cycles")
+            self._margin_read_fail_streak = 0
 
         if headroom_low(excess, MARGIN_HEADROOM_MIN_TWD):
             if not self._margin_alert_sent:

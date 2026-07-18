@@ -43,3 +43,17 @@ def headroom_low(ordexcess: Optional[float], min_twd: Optional[float]) -> bool:
         return float(ordexcess) < floor
     except (TypeError, ValueError):
         return False
+
+
+def read_failure_alert_due(streak: int, n: Optional[int]) -> bool:
+    """True exactly when the streak-th consecutive failed margin read hits the
+    escalation threshold n — fire once at streak == n (not >=) so the alert is
+    one-shot without extra latch state; the caller resets the streak on a
+    successful read, re-arming it for the next outage. n None/<=0 disables.
+
+    Rationale (2026-07-17 night): every failed read logged debug-only and
+    returned, so a whole-night query outage — which coincided with the margin
+    starvation it was meant to catch — was invisible."""
+    if not n or n <= 0:
+        return False
+    return streak == n

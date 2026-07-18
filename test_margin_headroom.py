@@ -3,7 +3,7 @@ Run:  python3 -m unittest test_margin_headroom -v
 """
 import unittest
 
-from margin_headroom import headroom_low
+from margin_headroom import headroom_low, read_failure_alert_due
 
 
 class HeadroomLow(unittest.TestCase):
@@ -45,6 +45,32 @@ class HeadroomLow(unittest.TestCase):
         # twdordexcess often arrives as a numeric string from the SDK.
         self.assertTrue(headroom_low("99999", self.MIN))
         self.assertFalse(headroom_low("150000", self.MIN))
+
+
+class ReadFailureAlertDue(unittest.TestCase):
+    """2026-07-17 night: the margin query returned no reliable read all night and the
+    watcher stayed silent (debug-only). After N consecutive failed reads in an active
+    session the caller must escalate once — fire exactly at streak == N so the alert
+    is one-shot without extra latch state; a successful read resets the streak."""
+
+    N = 10
+
+    def test_fires_exactly_at_threshold(self):
+        self.assertTrue(read_failure_alert_due(self.N, self.N))
+
+    def test_silent_before_threshold(self):
+        for streak in (0, 1, self.N - 1):
+            self.assertFalse(read_failure_alert_due(streak, self.N), streak)
+
+    def test_one_shot_past_threshold(self):
+        # Streak keeps growing during an outage; alert must NOT repeat every cycle.
+        for streak in (self.N + 1, self.N + 50):
+            self.assertFalse(read_failure_alert_due(streak, self.N), streak)
+
+    def test_disabled_when_n_zero_negative_or_none(self):
+        self.assertFalse(read_failure_alert_due(10, 0))
+        self.assertFalse(read_failure_alert_due(10, -1))
+        self.assertFalse(read_failure_alert_due(10, None))
 
 
 if __name__ == "__main__":

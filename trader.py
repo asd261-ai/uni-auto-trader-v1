@@ -310,7 +310,7 @@ class AutoTrader:
                 return None
             if not resp or not getattr(resp, "ok", False):
                 err = getattr(resp, "error", "unknown") if resp else "no response"
-                logger.debug(f"Margin query: broker not ok ({err})")
+                logger.info(f"Margin query: broker not ok ({err})")
                 return None
             data = getattr(resp, "data", None)
             if data is None:

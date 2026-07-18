@@ -32,9 +32,38 @@ class IsRejectStatus(unittest.TestCase):
                   "HHO0038:市價單不允許當日有效委託"):
             self.assertTrue(orj.is_reject_status(s), s)
 
+    def test_psc_margin_reject_is_reject(self):
+        # 2026-07-17 night: 4 entries rejected PSC0019 (保證金不足) — the PSC family
+        # was missing from _REJECT_PREFIXES, so rollback never fired and the units
+        # lingered as phantom trades (production ordernos PY381/QI277/QI876/RG149).
+        s = "PSC0019:保證金不足                                        36614          0"
+        self.assertTrue(orj.is_reject_status(s), s)
+
     def test_success_statuses_are_not_rejects(self):
         for s in ("委託成功", "完全成交", "刪單成功", "改價成功", "", None):
             self.assertFalse(orj.is_reject_status(s), repr(s))
+
+
+class IsMarginReject(unittest.TestCase):
+    """Margin-family rejects drive an immediate Health-bot alert (2026-07-17 night:
+    the whole-night starvation was silent because alerting depended on the polling
+    margin query succeeding; the reject reply itself is the most reliable signal)."""
+
+    def test_margin_family_codes_are_margin_rejects(self):
+        for s in ("PSC0019:保證金不足                                        36614          0",
+                  "FUF1239:同ID客戶未沖銷部位及委託保證金超過使用額度"):
+            self.assertTrue(orj.is_margin_reject(s), s)
+
+    def test_non_margin_rejects_are_not(self):
+        # Other reject families (no-position close, session, order-type) must NOT
+        # trigger the margin alert — they are not starvation signals.
+        for s in ("FUF0092:無足夠留倉口數平倉", "FUF0026:商品代號錯誤",
+                  "TTO0001:交易時間已結束", "HHO0038:市價單不允許當日有效委託"):
+            self.assertFalse(orj.is_margin_reject(s), s)
+
+    def test_success_and_empty_are_not(self):
+        for s in ("委託成功", "完全成交", "", None):
+            self.assertFalse(orj.is_margin_reject(s), repr(s))
 
 
 class RollbackRejectedEntry(unittest.TestCase):

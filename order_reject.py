@@ -1,7 +1,7 @@
 """Pure helpers for handling broker order rejections.
 
-When the broker rejects an order (margin FUF1239, no-position FUF0092, time TTO0001,
-market-ROD HHO0038, …) the SDK delivers a `reply` with that status but NO `match` (fill)
+When the broker rejects an order (margin FUF1239/PSC0019, no-position FUF0092,
+time TTO0001, market-ROD HHO0038, …) the SDK delivers a `reply` with that status but NO `match` (fill)
 event. The strategy's optimistic unit (appended at placement in _open_unit) then lingers
 as a phantom and later books phantom P&L. These helpers let the strategy roll back that
 unit. Pure + fully unit-tested; the strategy holds the lock.
@@ -17,12 +17,30 @@ from typing import Optional
 
 # Broker reject-code families (verified against production reply archives). Success
 # statuses (委託成功/完全成交/刪單成功/改價成功) are Chinese and never match these.
-_REJECT_PREFIXES = ("FUF", "TTO", "HHO")
+# PSC added 2026-07-18: margin-insufficiency rejects (PSC0019 保證金不足) observed
+# live on 2026-07-17 night — missing from this list, so rollback never fired and
+# four rejected entries lingered as phantom trades.
+_REJECT_PREFIXES = ("FUF", "TTO", "HHO", "PSC")
 
 
 def is_reject_status(status: Optional[str]) -> bool:
     """True if a broker reply status means 'rejected, no fill'."""
     return bool(status) and status.strip().startswith(_REJECT_PREFIXES)
+
+
+# Margin-insufficiency reject codes (shared-account starvation). Exact codes, not
+# families: FUF0092 etc. are rejects but say nothing about margin.
+_MARGIN_REJECT_CODES = ("FUF1239", "PSC0019")
+
+
+def is_margin_reject(status: Optional[str]) -> bool:
+    """True if a reject status specifically means insufficient margin.
+
+    Drives an immediate Health-bot alert: the reject reply is the broker itself
+    saying the account is starved, so it must not depend on the polling margin
+    query succeeding (2026-07-17 night: query failed all night → watcher silent
+    while four PSC0019 rejects sat in the log)."""
+    return bool(status) and status.strip().startswith(_MARGIN_REJECT_CODES)
 
 
 def rollback_rejected_entry(pending_fills: list, units: dict,

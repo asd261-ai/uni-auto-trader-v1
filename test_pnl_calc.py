@@ -313,8 +313,59 @@ class DivergenceWarnTest(unittest.TestCase):
     def test_none_fifo_no_warn(self):
         self.assertFalse(divergence_warn(None, 167.0, 0))
 
+    def test_open_position_suppresses_warn(self):
+        # 2026-07-17 13:21–13:28: FIFO vs per-trade legitimately diverge while
+        # overlapping positions are open (attribution transient) and reconverge at
+        # flat — an in-position WARNING is structural noise, not a data smell.
+        self.assertFalse(divergence_warn(170.0, 150.0, 0, is_flat=False))
 
-import os, tempfile
+    def test_flat_divergence_still_warns(self):
+        # Both real bugs (2026-06-24, 2026-07-16) still diverged AT flat — the
+        # flat-gate must not lose those true positives.
+        self.assertTrue(divergence_warn(170.0, 150.0, 0, is_flat=True))
+
+
+class BotIsFlatTest(unittest.TestCase):
+    """_bot_is_flat: flat means NO open units in EITHER source — mtx_state.json
+    (mtx_units) AND fvg_state.json (fvg_units). An FVG-only position must not count
+    as flat or the divergence flat-gate breaks for FVG-side overlaps."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._orig_mtx, self._orig_fvg = pc._STATE_PATH, pc._FVG_STATE_PATH
+        pc._STATE_PATH = os.path.join(self.tmp, "mtx_state.json")
+        pc._FVG_STATE_PATH = os.path.join(self.tmp, "fvg_state.json")
+
+    def tearDown(self):
+        pc._STATE_PATH, pc._FVG_STATE_PATH = self._orig_mtx, self._orig_fvg
+
+    def _write(self, path, obj):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def test_both_empty_is_flat(self):
+        self._write(pc._STATE_PATH, {"product": "MXFH6", "mtx_units": []})
+        self._write(pc._FVG_STATE_PATH, {"fvg_units": []})
+        self.assertTrue(pc._bot_is_flat())
+
+    def test_mtx_unit_open_not_flat(self):
+        self._write(pc._STATE_PATH, {"product": "MXFH6",
+                                     "mtx_units": [{"dir": "long", "entry": 44500}]})
+        self._write(pc._FVG_STATE_PATH, {"fvg_units": []})
+        self.assertFalse(pc._bot_is_flat())
+
+    def test_fvg_only_position_not_flat(self):
+        self._write(pc._STATE_PATH, {"product": "MXFH6", "mtx_units": []})
+        self._write(pc._FVG_STATE_PATH, {"fvg_units": [{"dir": "long", "entry": 44400}]})
+        self.assertFalse(pc._bot_is_flat())
+
+    def test_missing_files_fail_open_to_flat(self):
+        # Unreadable state → treat as flat (keep evaluating the check, matching
+        # _real_open()'s exception → "flat" convention).
+        self.assertTrue(pc._bot_is_flat())
+
+
+import json, os, tempfile
 import pnl_calc as pc
 
 
