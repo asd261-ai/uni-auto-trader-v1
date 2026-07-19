@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import unittest
 
-from flat_query import UNKNOWN, signed_net, query_net
+from flat_query import UNKNOWN, signed_net, query_net, close_order_fields
 
 
 class FakePos:
@@ -99,6 +99,30 @@ class QueryNet(unittest.TestCase):
     def test_schema_drift_propagates_unknown(self):
         api = FakeApi(FakeAccount(FakeResp(True, [DriftedPos("MXFG6")])))
         self.assertEqual(query_net(api, "0239174", "MXFG6"), UNKNOWN)
+
+
+class CloseOrderFields(unittest.TestCase):
+    """2026-07-19 audit: flat.py built its emergency close order with ONLY
+    ordercondition="R" and never set ordertype/price — the SDK default is an
+    empty ordertype, and every plausible broker interpretation is a rejection
+    (M+R is the empirically-rejected HHO0038 combo from 2026-07-10). The one
+    proven-valid market combo on viploginm is M + IOC (trader.py:363-368).
+    The emergency flatten tool must always emit exactly that combo."""
+
+    def test_market_close_is_m_plus_ioc(self):
+        f = close_order_fields("MXFH6", "S", 2, "0239174")
+        self.assertEqual(f["ordertype"], "M")
+        self.assertEqual(f["price"], 0)
+        self.assertEqual(f["ordercondition"], "I")   # IOC — M+R is broker-rejected
+
+    def test_close_flag_and_passthrough(self):
+        f = close_order_fields("MXFH6", "B", 1, "0239174")
+        self.assertEqual(f["opencloseflag"], "1")    # close
+        self.assertEqual(f["dtrade"], "N")
+        self.assertEqual(f["productid"], "MXFH6")
+        self.assertEqual(f["bs"], "B")
+        self.assertEqual(f["orderqty"], 1)
+        self.assertEqual(f["actno"], "0239174")
 
 
 if __name__ == "__main__":

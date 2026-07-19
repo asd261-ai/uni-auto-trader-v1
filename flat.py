@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from config import CONFIG
-from flat_query import UNKNOWN, query_net
+from flat_query import UNKNOWN, query_net, close_order_fields
 from order_guard import assert_order_allowed
 from unitrade.unitrade import Unitrade, DOrderObject
 
@@ -117,14 +117,13 @@ def on_match(m):
 api.dtrade.on_reply = on_reply
 api.dtrade.on_match = on_match
 
+# M + IOC via close_order_fields — the only proven-valid market combo on
+# viploginm (M+ROD is broker-rejected HHO0038; 2026-07-19 audit: the old code
+# here never set ordertype/price at all, so the close leg could never send a
+# valid order).
 order = DOrderObject()
-order.actno          = actno
-order.productid      = CONFIG["product"]
-order.bs             = bs_code
-order.orderqty       = qty_arg
-order.ordercondition = "R"     # market
-order.opencloseflag  = "1"     # close
-order.dtrade         = "N"
+for _k, _v in close_order_fields(CONFIG["product"], bs_code, qty_arg, actno).items():
+    setattr(order, _k, _v)
 
 print(f"Sending {bs_arg} {qty_arg} {CONFIG['product']} market close ...")
 assert_order_allowed()  # fails closed if the confirm above was ever bypassed (T010)

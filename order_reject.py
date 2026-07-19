@@ -43,8 +43,23 @@ def is_margin_reject(status: Optional[str]) -> bool:
     return bool(status) and status.strip().startswith(_MARGIN_REJECT_CODES)
 
 
+def _fresh(pend: dict, now_ms, max_age_ms) -> bool:
+    """Freshness gate (2026-07-19): the shared account delivers MANUAL orders'
+    rejects to the same reply stream. The bot's own reject arrives within
+    seconds of the send, so a pend older than max_age_ms cannot be the target
+    of this reject — exclude it (bail toward recon) rather than mis-rolling
+    back a live in-flight unit. No window / legacy pend without ts_ms → fresh."""
+    if now_ms is None or max_age_ms is None:
+        return True
+    ts = pend.get("ts_ms")
+    if ts is None:
+        return True
+    return (now_ms - ts) <= max_age_ms
+
+
 def rollback_rejected_entry(pending_fills: list, units: dict,
-                            productid: str, bs: str, our_product: str) -> Optional[dict]:
+                            productid: str, bs: str, our_product: str,
+                            now_ms=None, max_age_ms=None) -> Optional[dict]:
     """Undo an optimistically-recorded ENTRY whose broker order was rejected.
 
     Conservative, ambiguity-averse matching (caller holds the strategy lock):
@@ -65,6 +80,7 @@ def rollback_rejected_entry(pending_fills: list, units: dict,
         p for p in pending_fills
         if p.get("kind") == "entry" and p.get("bs") == bs
         and p.get("unit", {}).get("entry_fill") is None
+        and _fresh(p, now_ms, max_age_ms)
     ]
     if len(candidates) != 1:
         return None
@@ -78,7 +94,8 @@ def rollback_rejected_entry(pending_fills: list, units: dict,
 
 
 def rollback_rejected_exit(pending_fills: list, productid: str, bs: str,
-                           our_product: str) -> Optional[dict]:
+                           our_product: str,
+                           now_ms=None, max_age_ms=None) -> Optional[dict]:
     """Undo a rejected EXIT (close) order whose broker order was rejected (e.g. FUF0092
     no-position) so its pend stops poisoning the FIFO. The caller finalizes the pend's
     deferred record to exit_fill=null immediately instead of waiting for the 60s timeout.
@@ -97,7 +114,8 @@ def rollback_rejected_exit(pending_fills: list, productid: str, bs: str,
            and p.get("unit", {}).get("entry_fill") is None for p in pending_fills):
         return None
     candidates = [p for p in pending_fills
-                  if p.get("kind") == "exit" and p.get("bs") == bs]
+                  if p.get("kind") == "exit" and p.get("bs") == bs
+                  and _fresh(p, now_ms, max_age_ms)]
     if len(candidates) != 1:
         return None
     pend = candidates[0]

@@ -3,7 +3,7 @@ Run:  python3 -m unittest test_margin_headroom -v
 """
 import unittest
 
-from margin_headroom import headroom_low, read_failure_alert_due
+from margin_headroom import headroom_low, read_failure_alert_due, margin_alert_due
 
 
 class HeadroomLow(unittest.TestCase):
@@ -71,6 +71,33 @@ class ReadFailureAlertDue(unittest.TestCase):
         self.assertFalse(read_failure_alert_due(10, 0))
         self.assertFalse(read_failure_alert_due(10, -1))
         self.assertFalse(read_failure_alert_due(10, None))
+
+
+class MarginAlertDue(unittest.TestCase):
+    """2026-07-19 audit (fresh-diff lens): the reject-driven margin alert shares
+    the headroom latch, whose ONLY release is a successful margin read showing
+    healthy headroom. If the query keeps failing (exactly the 7/17 pattern), the
+    latch never clears and every later starvation episode is silent. Fix: the
+    latch expires after rearm_sec — a new reject after that fires one more alert."""
+
+    REARM = 4 * 3600
+
+    def test_unlatched_is_due(self):
+        self.assertTrue(margin_alert_due(False, 0.0, 1000.0, self.REARM))
+
+    def test_latched_recent_not_due(self):
+        now = 100_000.0
+        self.assertFalse(margin_alert_due(True, now - 60, now, self.REARM))
+
+    def test_latched_expired_is_due_again(self):
+        now = 100_000.0
+        self.assertTrue(margin_alert_due(True, now - self.REARM - 1, now, self.REARM))
+
+    def test_rearm_disabled_keeps_pure_latch(self):
+        # rearm_sec <= 0 or None → classic one-shot latch semantics.
+        now = 100_000.0
+        self.assertFalse(margin_alert_due(True, now - 999_999, now, 0))
+        self.assertFalse(margin_alert_due(True, now - 999_999, now, None))
 
 
 if __name__ == "__main__":

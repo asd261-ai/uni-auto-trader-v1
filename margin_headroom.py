@@ -57,3 +57,20 @@ def read_failure_alert_due(streak: int, n: Optional[int]) -> bool:
     if not n or n <= 0:
         return False
     return streak == n
+
+
+def margin_alert_due(latched: bool, last_alert_ts: float, now: float,
+                     rearm_sec: Optional[float]) -> bool:
+    """Whether a margin-starvation alert should fire.
+
+    The reject-driven alert (2026-07-18) shares the headroom latch, whose only
+    release is a successful margin read showing healthy headroom. If the query
+    keeps failing — exactly the 2026-07-17 outage pattern — the latch would
+    never clear and every later starvation episode would be silent. So the
+    latch expires: once now - last_alert_ts > rearm_sec, one more alert may
+    fire. rearm_sec None/<=0 disables expiry (classic one-shot latch)."""
+    if not latched:
+        return True
+    if not rearm_sec or rearm_sec <= 0:
+        return False
+    return (now - last_alert_ts) > rearm_sec

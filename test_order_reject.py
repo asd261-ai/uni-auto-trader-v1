@@ -136,6 +136,72 @@ class RollbackRejectedEntry(unittest.TestCase):
         self.assertIsNone(orj.rollback_rejected_entry([], {"mtx": []}, "MXFF6", "S", "MXFF6"))
 
 
+class RollbackFreshnessWindow(unittest.TestCase):
+    """2026-07-19 audit (fresh-diff lens on the PSC family addition): the shared
+    account means a MANUAL same-product order's margin reject (PSC0019/FUF1239)
+    also reaches on_order_rejected. If the bot's own entry has been in flight for
+    a while (its reject/fill would have arrived within seconds), a late foreign
+    reject must NOT roll back the bot's unit. Pends carry a ts_ms; candidates
+    older than max_age_ms are excluded. No ts / no window → legacy behaviour
+    (always eligible) so existing callers/tests are unaffected."""
+
+    NOW = 1_000_000_000_000
+    WINDOW = 15_000
+
+    def _entry_ts(self, unit, bs, ts_ms):
+        return {"kind": "entry", "bs": bs, "unit": unit, "ts_ms": ts_ms}
+
+    def test_fresh_entry_still_rolled_back(self):
+        u = _unit()
+        units = {"mtx": [u]}
+        pending = [self._entry_ts(u, "S", self.NOW - 2_000)]
+        got = orj.rollback_rejected_entry(pending, units, "MXFF6", "S", "MXFF6",
+                                          now_ms=self.NOW, max_age_ms=self.WINDOW)
+        self.assertIs(got, u)
+        self.assertEqual(units["mtx"], [])
+
+    def test_stale_entry_not_rolled_back(self):
+        # In-flight for 60s: its own broker verdict long since arrived — this
+        # reject belongs to a manual order. Bail, leave it to recon.
+        u = _unit()
+        units = {"mtx": [u]}
+        pending = [self._entry_ts(u, "S", self.NOW - 60_000)]
+        self.assertIsNone(orj.rollback_rejected_entry(
+            pending, units, "MXFF6", "S", "MXFF6",
+            now_ms=self.NOW, max_age_ms=self.WINDOW))
+        self.assertEqual(units["mtx"], [u])
+        self.assertEqual(len(pending), 1)
+
+    def test_no_window_keeps_legacy_behaviour(self):
+        u = _unit()
+        units = {"mtx": [u]}
+        pending = [self._entry_ts(u, "S", self.NOW - 60_000)]
+        self.assertIs(orj.rollback_rejected_entry(pending, units, "MXFF6", "S", "MXFF6"), u)
+
+    def test_pend_without_ts_treated_as_fresh(self):
+        u = _unit()
+        units = {"mtx": [u]}
+        pending = [_entry(u, "S")]   # legacy pend, no ts_ms
+        self.assertIs(orj.rollback_rejected_entry(
+            pending, units, "MXFF6", "S", "MXFF6",
+            now_ms=self.NOW, max_age_ms=self.WINDOW), u)
+
+    def test_stale_exit_not_rolled_back(self):
+        ex = {"kind": "exit", "bs": "S", "pe": "PE", "ts_ms": self.NOW - 60_000}
+        pending = [ex]
+        self.assertIsNone(orj.rollback_rejected_exit(
+            pending, "MXFF6", "S", "MXFF6",
+            now_ms=self.NOW, max_age_ms=self.WINDOW))
+        self.assertEqual(pending, [ex])
+
+    def test_fresh_exit_still_rolled_back(self):
+        ex = {"kind": "exit", "bs": "S", "pe": "PE", "ts_ms": self.NOW - 2_000}
+        pending = [ex]
+        got = orj.rollback_rejected_exit(pending, "MXFF6", "S", "MXFF6",
+                                         now_ms=self.NOW, max_age_ms=self.WINDOW)
+        self.assertIs(got, ex)
+
+
 class RollbackRejectedExit(unittest.TestCase):
     def test_single_exit_removed_and_returned(self):
         ex = _exit_pe("S")

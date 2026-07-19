@@ -15,7 +15,7 @@ import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no exec
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state, load_mtx_product, rolled_over
 from settlement_calendar import is_settlement_window
 from market_holidays import is_trading_day
-from margin_headroom import headroom_low, read_failure_alert_due
+from margin_headroom import headroom_low, read_failure_alert_due, margin_alert_due
 from session_timing import session_summary_action
 from exit_reason import stop_hit_reason
 from exit_sanity import sane_exit_price  # defense-in-depth vs Worker exit-price pollution (6/30)
@@ -184,6 +184,14 @@ MARGIN_HEADROOM_MIN_TWD = float(os.getenv("MARGIN_HEADROOM_MIN_TWD", "100000"))
 # silence exactly while margin starved). ~1 read/min → 10 ≈ 10 minutes blind.
 # 0 disables (no redeploy needed).
 MARGIN_READ_FAIL_ALERT_N = int(os.getenv("MARGIN_READ_FAIL_ALERT_N", "10"))
+# Margin-alert latch expiry: a reject-driven alert re-arms after this many
+# seconds even if the margin query never recovers (2026-07-19 audit — otherwise
+# a persistent query outage silences every later starvation episode). 0=off.
+MARGIN_ALERT_REARM_SEC = float(os.getenv("MARGIN_ALERT_REARM_SEC", "14400"))
+# Reject-rollback freshness window: a reject can only roll back a pend younger
+# than this (shared account: manual same-product rejects reach the same reply
+# stream; the bot's own verdict arrives within seconds). 0 disables.
+REJECT_ROLLBACK_MAX_AGE_MS = int(os.getenv("REJECT_ROLLBACK_MAX_AGE_MS", "15000")) or None
 
 # Tick-stale watchdog: detect when the dquote tick feed silently stops (alive but blind).
 TICK_STALE_DAY_SEC      = int(os.getenv("TICK_STALE_DAY_SEC", "90"))     # liquid day session
@@ -392,6 +400,7 @@ class MTXStrategy:
         # Shared-account margin headroom monitor (alert-only, never touches orders)
         self._margin_last_check:     float                  = 0.0    # epoch s of last get_margin
         self._margin_alert_sent:     bool                   = False  # one-shot dedup latch
+        self._margin_alert_ts:       float                  = 0.0    # epoch s of last starvation alert (latch TTL)
         self._margin_read_fail_streak: int                  = 0      # consecutive failed margin reads
 
         # Tick-stale watchdog: detect when the dquote tick feed silently stops delivering
@@ -753,15 +762,18 @@ class MTXStrategy:
         poison the FIFO for the next fills."""
         booked_exit = None
         cleared_only = False
+        now_ms = int(time.time() * 1000)
         with self._lock:
             unit = order_reject.rollback_rejected_entry(
                 self._pending_fills, self._units, productid, bs,
                 self.trader.config.get("product"),
+                now_ms=now_ms, max_age_ms=REJECT_ROLLBACK_MAX_AGE_MS,
             )
             if unit is None:
                 pend = order_reject.rollback_rejected_exit(
                     self._pending_fills, productid, bs,
                     self.trader.config.get("product"),
+                    now_ms=now_ms, max_age_ms=REJECT_ROLLBACK_MAX_AGE_MS,
                 )
                 if pend is not None:
                     pe = pend.get("pe")
@@ -796,8 +808,11 @@ class MTXStrategy:
         # silent while four PSC0019 rejects sat in the log). Reuses the headroom
         # latch: one alert per starvation episode, no 4-rejects-4-messages burst, and
         # the existing recovery notify closes the loop once the query reads healthy.
-        if order_reject.is_margin_reject(orderstatus) and not self._margin_alert_sent:
+        if order_reject.is_margin_reject(orderstatus) and margin_alert_due(
+                self._margin_alert_sent, self._margin_alert_ts, time.time(),
+                MARGIN_ALERT_REARM_SEC):
             self._margin_alert_sent = True
+            self._margin_alert_ts = time.time()
             status_clean = (orderstatus or "").strip()
             logger.warning(f"MARGIN_REJECT_ALERT: {productid} {bs} status={status_clean}")
             threading.Thread(target=self._safe_health_notify, args=(
@@ -1446,6 +1461,7 @@ class MTXStrategy:
         if headroom_low(excess, MARGIN_HEADROOM_MIN_TWD):
             if not self._margin_alert_sent:
                 self._margin_alert_sent = True
+                self._margin_alert_ts = time.time()
                 logger.warning(
                     f"MARGIN_HEADROOM_LOW: ordexcess={excess:.0f} "
                     f"floor={MARGIN_HEADROOM_MIN_TWD:.0f}"
@@ -2017,11 +2033,24 @@ class MTXStrategy:
 
         if place_order:
             if direction == "long":
-                self._execute_order("BUY", product, 1)
+                sent = self._execute_order("BUY", product, 1)
             elif direction == "short":
-                self._execute_order("SELL", product, 1)
+                sent = self._execute_order("SELL", product, 1)
             else:
                 logger.warning(f"Unknown direction: {direction}")
+                return
+            if not sent:
+                # issend=False (SDK client failure / order-guard block): no broker
+                # order exists, so no reply will ever trigger the reject rollback.
+                # Booking the unit here would create a phantom (2026-07-19 audit).
+                # The signal cursor has advanced → this entry is skipped, fail-safe.
+                logger.warning(
+                    f"{source.upper()} entry NOT BOOKED — send failed client-side | "
+                    f"dir={direction} id={trade.get('id')}")
+                threading.Thread(target=self._safe_health_notify, args=(
+                    f"🚫 <b>{SOURCE_TAG.get(source, source)}進場單送出失敗</b>\n"
+                    f"{direction} id={trade.get('id')} 券商端無此單,已跳過不記帳。",),
+                    daemon=True).start()
                 return
 
         unit = {
@@ -2040,7 +2069,8 @@ class MTXStrategy:
         # attributes the real entry price to this unit, reversal/replace-safe via FIFO.
         if place_order:
             self._pending_fills.append({"kind": "entry", "bs": "B" if direction == "long" else "S",
-                                        "unit": unit, "source": source, "id": unit["id"]})
+                                        "unit": unit, "source": source, "id": unit["id"],
+                                        "ts_ms": int(time.time() * 1000)})
             self._pending_fills = self._pending_fills[-12:]
         logger.info(f"{source.upper()} Unit {len(self._units[source])} opened | "
                     f"{direction} entry={unit['entry']} stop={unit['stop']}")
@@ -2102,9 +2132,23 @@ class MTXStrategy:
         product = self.trader.config["product"]
         if place_order:
             if unit["dir"] == "long":
-                self._execute_order("SELL", product, 1, opencloseflag="1")
+                sent = self._execute_order("SELL", product, 1, opencloseflag="1")
             else:
-                self._execute_order("BUY", product, 1, opencloseflag="1")
+                sent = self._execute_order("BUY", product, 1, opencloseflag="1")
+            if not sent:
+                # issend=False: the position is STILL LIVE at the broker. Booking the
+                # close would silently drop a real position from tracking (2026-07-19
+                # audit). Keep the unit — the next tick's exit check retries the send.
+                logger.error(
+                    f"{source.upper()} close send FAILED client-side — unit kept for "
+                    f"retry | dir={unit['dir']} id={unit['id']} reason={reason}")
+                if not unit.get("_close_fail_notified"):
+                    unit["_close_fail_notified"] = True
+                    threading.Thread(target=self._safe_health_notify, args=(
+                        f"⚠️ <b>{SOURCE_TAG.get(source, source)}平倉單送出失敗</b>\n"
+                        f"{unit['dir']} id={unit['id']} 持倉仍在券商,將於下一 tick 重試。",),
+                        daemon=True).start()
+                return
             # Fill-anchoring: register a pending EXIT fill so on_fill's FIFO stays
             # aligned with send order (so an exit fill isn't mis-read as an entry fill
             # on same-direction reversals). Exit fills are consumed but not acted on
@@ -2112,7 +2156,8 @@ class MTXStrategy:
             # Created here (send order). Appended to _pending_fills only after its
             # deferred record `pe` is attached below, so it never sits in the queue
             # with pe missing (closes a race window if a caller ever skips the lock).
-            exit_pending = {"kind": "exit", "bs": "S" if unit["dir"] == "long" else "B"}
+            exit_pending = {"kind": "exit", "bs": "S" if unit["dir"] == "long" else "B",
+                            "ts_ms": int(time.time() * 1000)}
 
         pnl_pts = 0
         if exit_price and unit["entry"]:
@@ -2273,13 +2318,15 @@ class MTXStrategy:
     def _execute_order(self, side: str, product: str, qty: int, opencloseflag: str = ""):
         if self.dry_run:
             logger.info(f"[DRY RUN] {side} {product} x{qty} opencloseflag={opencloseflag!r}")
-            return
+            return True
         if side == "BUY":
             resp = self.trader.buy(product, qty, opencloseflag=opencloseflag)
         else:
             resp = self.trader.sell(product, qty, opencloseflag=opencloseflag)
         if not resp.issend:
             logger.error(f"Order failed | {side} {product}: {resp.errormsg}")
+            return False
+        return True
 
     # ── 通知 ─────────────────────────────────────────────────────
 

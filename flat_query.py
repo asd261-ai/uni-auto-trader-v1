@@ -42,3 +42,25 @@ def query_net(api, actno: str, product: str):
     if not resp or not getattr(resp, "ok", False):
         return UNKNOWN
     return signed_net(getattr(resp, "data", None) or [], product)
+
+
+def close_order_fields(product: str, bs_code: str, qty: int, actno: str) -> dict:
+    """Field values for the emergency market close order.
+
+    M + IOC is the ONLY proven-valid market combo on viploginm: M/P with ROD is
+    broker-rejected (HHO0038, observed live 2026-07-10; see trader.py:363-368).
+    2026-07-19 audit: flat.py had shipped since 2026-05-15 with ordertype unset
+    (SDK default "") and ordercondition="R" — every interpretation of that combo
+    is a rejection, so the emergency close leg could never have worked.
+    """
+    return {
+        "actno":          actno,
+        "productid":      product,
+        "bs":             bs_code,
+        "orderqty":       qty,
+        "ordertype":      "M",   # market
+        "price":          0,
+        "ordercondition": "I",   # IOC — market orders may not use ROD on viploginm
+        "opencloseflag":  "1",   # close
+        "dtrade":         "N",
+    }
