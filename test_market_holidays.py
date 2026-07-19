@@ -6,6 +6,7 @@ import unittest
 from datetime import date
 
 from market_holidays import TW_MARKET_HOLIDAYS, is_market_holiday, is_trading_day
+import market_holidays as mh
 
 
 class HolidayCalendarTest(unittest.TestCase):
@@ -46,3 +47,26 @@ class HolidayCalendarTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CalendarExpiryTest(unittest.TestCase):
+    """2026-07-19 audit: the table only covers 2026 — on 2027-01-01 (a Friday
+    holiday) is_trading_day() silently returns True and the armed tick-stale
+    kill restart-storms all day on the dead feed. The calendar must announce
+    its own expiry instead of aging out silently."""
+
+    def test_covered_year_no_warning(self):
+        self.assertIsNone(mh.expiry_warning(date(2026, 7, 20)))
+
+    def test_december_warns_about_next_uncovered_year(self):
+        w = mh.expiry_warning(date(2026, 12, 1))
+        self.assertIsNotNone(w)
+        self.assertIn("2027", w)
+
+    def test_uncovered_year_warns(self):
+        self.assertIsNotNone(mh.expiry_warning(date(2027, 1, 1)))
+
+    def test_uncovered_year_still_weekday_based(self):
+        # Behavior unchanged (fail toward trading) — the warning is the defense.
+        self.assertTrue(mh.is_trading_day(date(2027, 1, 4)))   # Mon
+        self.assertFalse(mh.is_trading_day(date(2027, 1, 2)))  # Sat

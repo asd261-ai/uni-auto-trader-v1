@@ -263,9 +263,12 @@ class AutoTrader:
                 logger.error(f"broker get_position timed out after {SDK_READ_TIMEOUT_SEC}s — skipping recon cycle")
                 return SCHEMA_FAIL
             if not resp or not getattr(resp, "ok", False):
+                # No reliable read — NOT flat (2026-07-19 audit: returning None
+                # here made recon read broker_net=0 → false lost-position alert
+                # during any mid-session API outage). SCHEMA_FAIL → skip cycle.
                 err = getattr(resp, "error", "unknown") if resp else "no response"
-                logger.warning(f"Position query: broker not ok ({err})")
-                return None
+                logger.warning(f"Position query: broker not ok ({err}) — skipping recon cycle")
+                return SCHEMA_FAIL
             positions = getattr(resp, "data", None) or []
             product = self.config["product"]
             for p in positions:
@@ -281,7 +284,7 @@ class AutoTrader:
             return None  # 該商品不在回傳中 / 已平倉
         except Exception as e:
             logger.error(f"Position query failed: {e}")
-        return None
+        return SCHEMA_FAIL  # exception = no reliable read, never "flat" (2026-07-19 audit)
 
     def _query_broker_margin_excess(self, currency: str = "TWD"):
         """Available order-excess margin (DMargin.twdordexcess) in NT$, or None.

@@ -41,8 +41,13 @@ def load_state():
 
 def save_state(state):
     state.sort(key=lambda x: x["date"])
-    with open(STATE_PATH, "w") as f:
+    # Atomic (2026-07-19 audit): the live trader reads this file cross-process
+    # in _check_regime; an in-place truncate-write raced that read and could
+    # cache a bogus 'undefined' regime off a partial file.
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    tmp.replace(STATE_PATH)
 
 
 def append_close(d: str, close: float, source: str = "manual"):

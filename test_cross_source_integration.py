@@ -22,3 +22,25 @@ class June29Collision(unittest.TestCase):
         got = orj.rollback_rejected_exit(pending, "MXFG6", "B", "MXFG6")
         self.assertIs(got, exit_pend)
         self.assertEqual(pending, [], "stale exit pend must be gone → no FIFO poison")
+
+
+class June29StrategyWiring(unittest.TestCase):
+    """2026-07-19 audit: this file claimed to be the 6/29 regression but only
+    asserted two pure helpers — the strategy-side wiring (the actual fix) was
+    untested. This exercises the real _open_unit branch."""
+
+    def test_fvg_long_blocked_at_strategy_level_when_mtx_short_held(self):
+        from test_issend_wiring import _make_strategy, _trade
+        from test_audit_p1_wiring import _harden
+        import strategy as strategy_mod
+        s = _harden(_make_strategy(send_ok=True))
+        s._current_session = "night"
+        s._units["mtx"] = [{"dir": "short"}]
+        orig = strategy_mod.CROSS_SOURCE_OPP_MODE
+        strategy_mod.CROSS_SOURCE_OPP_MODE = "on"
+        try:
+            s._open_unit(_trade(dir_="long"), "fvg", notify=False, place_order=True)
+        finally:
+            strategy_mod.CROSS_SOURCE_OPP_MODE = orig
+        self.assertEqual(s._units["fvg"], [], "FVG long must be skip-absorbed (net-0 collision)")
+        self.assertEqual(s._send_calls, [])

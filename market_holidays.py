@@ -58,3 +58,25 @@ def is_market_holiday(d):
 def is_trading_day(d):
     """d: datetime.date -> True if a normal TAIFEX trading day (weekday & not holiday)."""
     return d.weekday() <= 4 and not is_market_holiday(d)
+
+
+# Latest year the table above actually covers. Bump when adding a new year's
+# calendar. expiry_warning() lets the trader announce the table aging out
+# instead of silently treating un-tabled holidays as trading days (2026-07-19
+# audit: 2027-01-01 would restart-storm the armed tick-stale kill all day).
+_CALENDAR_MAX_YEAR = 2026
+
+
+def expiry_warning(d):
+    """Optional[str]: a human-readable warning when the holiday table no longer
+    (or soon won't) cover the date. December of the last covered year warns
+    ahead of time; any date past the covered range warns loudly."""
+    if d.year > _CALENDAR_MAX_YEAR:
+        return (f"TAIFEX holiday calendar only covers up to {_CALENDAR_MAX_YEAR} — "
+                f"{d.year} holidays are NOT gated (armed watchdogs may restart-storm "
+                f"on holiday dead feeds). Update market_holidays.py.")
+    if d.year == _CALENDAR_MAX_YEAR and d.month == 12:
+        return (f"TAIFEX holiday calendar ends after {_CALENDAR_MAX_YEAR} — add the "
+                f"{_CALENDAR_MAX_YEAR + 1} calendar before New Year "
+                f"(first uncovered holiday: {_CALENDAR_MAX_YEAR + 1}-01-01).")
+    return None

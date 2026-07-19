@@ -14,7 +14,7 @@ import telegram_notify as tg
 import pnl_calc  # additive: real-fill P&L from orders.jsonl (read-only, no execution impact)
 from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state, load_mtx_product, rolled_over
 from settlement_calendar import is_settlement_window
-from market_holidays import is_trading_day
+from market_holidays import is_trading_day, expiry_warning as holiday_calendar_expiry_warning
 from margin_headroom import headroom_low, read_failure_alert_due, margin_alert_due
 from session_timing import session_summary_action, weekend_dormant
 from exit_reason import stop_hit_reason
@@ -192,6 +192,11 @@ MARGIN_ALERT_REARM_SEC = float(os.getenv("MARGIN_ALERT_REARM_SEC", "14400"))
 # than this (shared account: manual same-product rejects reach the same reply
 # stream; the bot's own verdict arrives within seconds). 0 disables.
 REJECT_ROLLBACK_MAX_AGE_MS = int(os.getenv("REJECT_ROLLBACK_MAX_AGE_MS", "15000")) or None
+# Escalate once after N consecutive failed real-P&L reads in an active session:
+# the DAILY_MAX_LOSS breaker fail-opens on a bad read, and a persistent failure
+# (corrupt orders.jsonl, perms) left it silently dead (2026-07-19 audit). Same
+# pattern as MARGIN_READ_FAIL_ALERT_N. 0 disables.
+PNL_READ_FAIL_ALERT_N = int(os.getenv("PNL_READ_FAIL_ALERT_N", "10"))
 
 # Tick-stale watchdog: detect when the dquote tick feed silently stops (alive but blind).
 TICK_STALE_DAY_SEC      = int(os.getenv("TICK_STALE_DAY_SEC", "90"))     # liquid day session
@@ -406,6 +411,7 @@ class MTXStrategy:
         self._margin_alert_sent:     bool                   = False  # one-shot dedup latch
         self._margin_alert_ts:       float                  = 0.0    # epoch s of last starvation alert (latch TTL)
         self._margin_read_fail_streak: int                  = 0      # consecutive failed margin reads
+        self._pnl_read_fail_streak:  int                    = 0      # consecutive failed real-P&L reads (breaker blind)
 
         # Tick-stale watchdog: detect when the dquote tick feed silently stops delivering
         # (trader alive but blind to price → exits won't fire). Alert-only; see tick_watchdog.py.
@@ -574,6 +580,14 @@ class MTXStrategy:
         now = datetime.now(TZ_TW)
         self._current_session = _get_session(now)
         logger.info(f"Current session: {self._current_session}")
+
+        # Holiday-calendar expiry check (2026-07-19 audit): the table ages out
+        # silently — un-tabled holidays restart-storm the armed watchdogs.
+        cal_warn = holiday_calendar_expiry_warning(now.date())
+        if cal_warn:
+            logger.warning(cal_warn)
+            threading.Thread(target=self._safe_health_notify,
+                             args=(f"⚠️ {cal_warn}",), daemon=True).start()
 
         # Restore current-month P&L counters from trades.jsonl (so restart preserves state)
         self._restore_month_from_log()
@@ -803,6 +817,7 @@ class MTXStrategy:
                 self._pending_fills, self._units, productid, bs,
                 self.trader.config.get("product"),
                 now_ms=now_ms, max_age_ms=REJECT_ROLLBACK_MAX_AGE_MS,
+                margin_reject=order_reject.is_margin_reject(orderstatus),
             )
             if unit is None:
                 pend = order_reject.rollback_rejected_exit(
@@ -1007,9 +1022,18 @@ class MTXStrategy:
     def _position_is_flat(self) -> bool:
         # In-memory only: no broker call (the watchdog thread must never block on
         # the SDK). Mirrors the flat notion used by precheck Gate 3 / reconcile.
-        return (not self._units.get("mtx")
-                and not self._units.get("fvg")
-                and not self._pending_fills)
+        # Lock-guarded (2026-07-19 audit): _open_unit sends the broker order
+        # BEFORE appending the unit, all under the lock — an unlocked read here
+        # could see "flat" mid-entry and let the fd soft-kill fire with a real
+        # order in flight. Can't acquire promptly → NOT flat (never kill blind).
+        if not self._lock.acquire(timeout=2.0):
+            return False
+        try:
+            return (not self._units.get("mtx")
+                    and not self._units.get("fvg")
+                    and not self._pending_fills)
+        finally:
+            self._lock.release()
 
     def _fd_wd_loop(self) -> None:
         # Runs in its OWN daemon thread, never the poll loop. Reads /proc/self/fd
@@ -1065,7 +1089,7 @@ class MTXStrategy:
     def _record_trade(self, *, source: str, label: str, dir_: str, entry, exit_price,
                        stop, target, pnl_pts: float, reason: str, sig_id, opened_at_ms,
                        entry_fill=None, exit_fill=None, pnl_pts_real=None,
-                       fill_timeout=False):
+                       fill_timeout=False, trading_day=None, session=None):
         """Append one trade record to trades.jsonl AND update monthly counters.
 
         Called from _close_unit for every closed unit regardless of source.
@@ -1073,14 +1097,21 @@ class MTXStrategy:
         """
         try:
             now = datetime.now(TZ_TW)
-            trading_day = self._compute_trading_day(now)
+            # Caller-provided stamps win (2026-07-19 audit): the boot flush and
+            # missed-exit paths write records for trades that CLOSED before this
+            # process started — stamping "now" mis-bucketed them across the
+            # 08:45 / month boundary. Normal close-path calls omit them.
+            if trading_day is None:
+                trading_day = self._compute_trading_day(now).isoformat()
+            if session is None:
+                session = self._current_session
             duration_sec = None
             if isinstance(opened_at_ms, (int, float)) and opened_at_ms > 0:
                 duration_sec = int(time.time() - opened_at_ms / 1000)
             record = {
                 "ts":           int(time.time()),
-                "trading_day":  trading_day.isoformat(),
-                "session":      self._current_session,
+                "trading_day":  trading_day,
+                "session":      session,
                 "source":       source,
                 "id":           sig_id,
                 "label":        label,
@@ -1124,46 +1155,55 @@ class MTXStrategy:
 
     def _archive_and_reset_month(self, old_month: str, new_month: str):
         """Called on month boundary (trading-day basis). Writes summary to
-        monthly_summary.jsonl + Telegram notification + resets in-memory counters."""
-        try:
+        monthly_summary.jsonl + Telegram notification + resets in-memory counters.
+        Lock-guarded (2026-07-19 audit): the counters are written by the broker
+        fill thread under self._lock; reading+zeroing them here unlocked could
+        drop a fill that lands exactly on the month boundary."""
+        with self._lock:
             wr = self._month_wins / max(self._month_trades_count, 1) * 100
+            snapshot = (self._month_pnl_pts, self._month_trades_count,
+                        self._month_wins, self._month_losses,
+                        {k: dict(v) for k, v in self._month_by_source.items()})
+            self._month_pnl_pts = 0.0
+            self._month_trades_count = 0
+            self._month_wins = 0
+            self._month_losses = 0
+            self._month_by_source = {}
+        pnl_pts, trades_count, wins, losses, by_source = snapshot
+        try:
             summary = {
                 "month":         old_month,
-                "total_pnl_pts": self._month_pnl_pts,
-                "total_pnl_ntd": int(self._month_pnl_pts * POINT_VALUE),
-                "trades":        self._month_trades_count,
-                "wins":          self._month_wins,
-                "losses":        self._month_losses,
+                "total_pnl_pts": pnl_pts,
+                "total_pnl_ntd": int(pnl_pts * POINT_VALUE),
+                "trades":        trades_count,
+                "wins":          wins,
+                "losses":        losses,
                 "win_rate_pct":  round(wr, 2),
-                "by_source":     self._month_by_source,
+                "by_source":     by_source,
                 "archived_at":   int(time.time() * 1000),
             }
             with open(MONTHLY_SUMMARY_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(summary, ensure_ascii=False) + "\n")
             # Telegram summary
             by_src_parts = []
-            for src, d in self._month_by_source.items():
+            for src, d in by_source.items():
                 sign = "+" if d.get("pnl_pts", 0) >= 0 else ""
                 by_src_parts.append(f"{src.upper()} {sign}{d.get('pnl_pts', 0):.0f}pts ({d.get('count', 0)})")
             by_src_line = "  ".join(by_src_parts) if by_src_parts else "(無)"
-            sign = "+" if self._month_pnl_pts >= 0 else ""
+            sign = "+" if pnl_pts >= 0 else ""
             self._safe_notify(
                 f"🌙 <b>月結 — {old_month}</b>\n"
-                f"總筆數:{self._month_trades_count}\n"
-                f"勝/敗:{self._month_wins}/{self._month_losses} ({wr:.1f}%)\n"
-                f"合計:{sign}{self._month_pnl_pts:.0f} pts ({sign}NT${int(self._month_pnl_pts * POINT_VALUE):,})\n"
+                f"總筆數:{trades_count}\n"
+                f"勝/敗:{wins}/{losses} ({wr:.1f}%)\n"
+                f"合計:{sign}{pnl_pts:.0f} pts ({sign}NT${int(pnl_pts * POINT_VALUE):,})\n"
                 f"依來源:{by_src_line}\n"
                 f"📅 {new_month} 起重新計算"
             )
-            logger.info(f"Month archived: {old_month} pnl={self._month_pnl_pts:+.0f}pts trades={self._month_trades_count}")
+            logger.info(f"Month archived: {old_month} pnl={pnl_pts:+.0f}pts trades={trades_count}")
         except Exception as e:
             logger.error(f"month archive failed: {e}")
-        # Reset counters (always, even if archive write failed — don't double-count)
-        self._month_pnl_pts        = 0.0
-        self._month_trades_count   = 0
-        self._month_wins           = 0
-        self._month_losses         = 0
-        self._month_by_source      = {}
+        # (Counters were snapshotted+zeroed atomically under the lock above —
+        # a fill landing during the archive write goes to the NEW month.)
 
     def _restore_month_from_log(self):
         """On startup, scan trades.jsonl, filter to current month (trading-day basis),
@@ -1295,18 +1335,34 @@ class MTXStrategy:
     def _record_missed_exit(self, unit: dict, worker: dict) -> None:
         """A locally-held MTX unit the Worker shows already closed (exited while the bot
         was down). Record the trade once; do NOT restore it as open (no double-count)."""
-        exit_price = worker.get("exit", worker.get("exitPrice"))
+        # Worker terminal records write closePrice/pnl/closedAt (worker/index.js
+        # exit paths) — never exit/exitPrice. Reading only the latter booked
+        # exit=None pnl=0 for EVERY offline exit (2026-07-19 audit).
+        exit_price = worker.get("closePrice", worker.get("exit", worker.get("exitPrice")))
         reason = worker.get("status", "session_end")
         entry = unit.get("entry")
-        # Compute pnl_pts from entry/exit if both numeric; fallback to 0.0
+        # pnl: entry/exit arithmetic when possible; else the Worker's own signal-side pnl.
         try:
             if entry is not None and exit_price is not None:
                 raw = float(exit_price) - float(entry)
                 pnl_pts = raw if unit.get("dir") == "long" else -raw
+            elif worker.get("pnl") is not None:
+                pnl_pts = float(worker["pnl"])
             else:
                 pnl_pts = 0.0
         except (TypeError, ValueError):
             pnl_pts = 0.0
+        # Stamp the day/session the trade actually CLOSED in when the Worker
+        # recorded it (closedAt ms); fall back to boot-time stamps otherwise.
+        trading_day = None
+        session = None
+        try:
+            if worker.get("closedAt"):
+                closed_dt = datetime.fromtimestamp(worker["closedAt"] / 1000, TZ_TW)
+                trading_day = self._compute_trading_day(closed_dt).isoformat()
+                session = _get_session(closed_dt)
+        except (TypeError, ValueError, OSError):
+            pass
         try:
             self._record_trade(
                 source="mtx",
@@ -1320,6 +1376,8 @@ class MTXStrategy:
                 reason=reason,
                 sig_id=unit.get("id"),
                 opened_at_ms=unit.get("opened_at"),
+                trading_day=trading_day,
+                session=session,
             )
             logger.info(f"Startup: recorded missed MTX exit id={unit.get('id')} reason={reason}")
         except Exception as e:
@@ -1581,14 +1639,34 @@ class MTXStrategy:
         """
         if DAILY_MAX_LOSS_PTS is None or self._trading_day_locked:
             return
+        real = None
         try:
             real = pnl_calc.heartbeat_fields(
                 base=self.trader.config["product"]
             ).get("real_trading_day_pnl_pts")
         except Exception as e:
-            logger.debug(f"daily-loss lock: real P&L read failed (skip): {e}")
+            logger.info(f"daily-loss lock: real P&L read failed (skip): {e}")
+        if real is None:
+            # Fail-open is correct per-cycle, but a PERSISTENT read failure means
+            # the breaker is dead while believed armed (2026-07-19 audit) —
+            # escalate once, same pattern as the margin read-fail alert.
+            if self._current_session in ("day", "night"):
+                self._pnl_read_fail_streak += 1
+                if read_failure_alert_due(self._pnl_read_fail_streak, PNL_READ_FAIL_ALERT_N):
+                    logger.warning(
+                        f"PNL_READ_FAIL: {self._pnl_read_fail_streak} consecutive failed "
+                        f"real-P&L reads — DAILY_MAX_LOSS breaker blind")
+                    self._safe_health_notify(
+                        f"⚠️ <b>真實 P&L 連續讀取失敗</b>\n"
+                        f"連續 {self._pnl_read_fail_streak} 次讀不到當日真實損益,"
+                        f"DAILY_MAX_LOSS 熔斷目前失明(fail-open)。\n"
+                        f"請檢查 orders.jsonl / pnl_calc。")
             return
-        if real is None or real > DAILY_MAX_LOSS_PTS:
+        if self._pnl_read_fail_streak:
+            logger.info(f"daily-loss lock: real P&L read recovered after "
+                        f"{self._pnl_read_fail_streak} failed cycles")
+            self._pnl_read_fail_streak = 0
+        if real > DAILY_MAX_LOSS_PTS:
             return
         self._trading_day_locked = True
         logger.warning(f"DAILY_MAX_LOSS triggered: real_day_pnl={real:+.0f} ≤ {DAILY_MAX_LOSS_PTS:+.0f}")
@@ -2245,6 +2323,11 @@ class MTXStrategy:
             target=unit["target"], pnl_pts=pnl_pts, reason=reason,
             sig_id=unit["id"], opened_at_ms=unit.get("opened_at"),
             entry_fill=unit.get("entry_fill"),
+            # Close-time stamps (2026-07-19 audit): a deferred record flushed at
+            # boot after a crash must keep the day/session it CLOSED in, not the
+            # boot day — else month/day buckets shift across 08:45 or month-end.
+            trading_day=self._compute_trading_day(datetime.now(TZ_TW)).isoformat(),
+            session=self._current_session,
         )
         if place_order:
             pe = {"record": record_kwargs,

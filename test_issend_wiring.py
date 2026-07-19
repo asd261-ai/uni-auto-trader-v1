@@ -49,6 +49,7 @@ def _make_strategy(send_ok: bool):
     s._session_trades = []
     s._trading_day_pnl_pts = 0
     s._trading_day_locked = False
+    s._current_session = "night"
     s._last_price = None
     s._should_place_order = lambda source: True
     s._save_mtx_state = lambda: None

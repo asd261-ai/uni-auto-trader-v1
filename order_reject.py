@@ -59,7 +59,8 @@ def _fresh(pend: dict, now_ms, max_age_ms) -> bool:
 
 def rollback_rejected_entry(pending_fills: list, units: dict,
                             productid: str, bs: str, our_product: str,
-                            now_ms=None, max_age_ms=None) -> Optional[dict]:
+                            now_ms=None, max_age_ms=None,
+                            margin_reject: bool = False) -> Optional[dict]:
     """Undo an optimistically-recorded ENTRY whose broker order was rejected.
 
     Conservative, ambiguity-averse matching (caller holds the strategy lock):
@@ -74,7 +75,13 @@ def rollback_rejected_entry(pending_fills: list, units: dict,
     """
     if productid != our_product:
         return None
-    if any(p.get("kind") == "exit" and p.get("bs") == bs for p in pending_fills):
+    # Same-side-exit bail — EXCEPT for margin rejects (2026-07-19 audit): during
+    # a reversal both legs share the same bs, so this bail plus the exit-side
+    # mirror bail made ANY reject a double no-op (phantom unit + poisoned FIFO).
+    # A margin reject can only be the OPENING leg (closing an offsetting
+    # position requires no new margin), so the ambiguity doesn't exist there.
+    if not margin_reject and any(
+            p.get("kind") == "exit" and p.get("bs") == bs for p in pending_fills):
         return None
     candidates = [
         p for p in pending_fills

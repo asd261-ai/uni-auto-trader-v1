@@ -37,7 +37,7 @@ def send(token: str, chat_id: str, text: str) -> bool:
                 timeout=10,
             )
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 5))
+                retry_after = _capped_retry_after(resp.headers.get("Retry-After"))
                 logger.warning(f"Telegram 429 (attempt {attempt}) — sleeping {retry_after}s")
                 time.sleep(retry_after)
                 continue
@@ -53,3 +53,16 @@ def send(token: str, chat_id: str, text: str) -> bool:
 
     logger.error("Telegram send failed after all retries — message dropped")
     return False
+
+
+# 2026-07-19 audit: Telegram flood-waits can be minutes; several strategy call
+# sites send synchronously on the poll thread (which owns exit checks), so an
+# uncapped time.sleep(Retry-After) froze exits for the whole flood-wait.
+_RETRY_AFTER_CAP_SEC = 10
+
+
+def _capped_retry_after(header_val) -> int:
+    try:
+        return min(int(header_val), _RETRY_AFTER_CAP_SEC)
+    except (TypeError, ValueError):
+        return 5

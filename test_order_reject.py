@@ -202,6 +202,40 @@ class RollbackFreshnessWindow(unittest.TestCase):
         self.assertIs(got, ex)
 
 
+class ReversalMarginRejectCarveOut(unittest.TestCase):
+    """2026-07-19 audit: during a reversal both legs share the same bs (close
+    long = SELL, open short = SELL), so a reject made BOTH rollbacks bail —
+    phantom unit + poisoned FIFO (the 7/17 PSC0019 event's remaining variant).
+    A MARGIN reject can only be the OPENING leg (closing an offsetting position
+    needs no new margin), so margin rejects may skip the same-side-exit bail.
+    Non-margin rejects (e.g. FUF0092 = close-side) keep the conservative bail."""
+
+    def test_margin_reject_rolls_back_entry_despite_same_side_exit(self):
+        u = _unit(dir_="short")
+        units = {"mtx": [u]}
+        pending = [_exit("S"), _entry(u, "S")]     # reversal in flight
+        got = orj.rollback_rejected_entry(pending, units, "MXFF6", "S", "MXFF6",
+                                          margin_reject=True)
+        self.assertIs(got, u)
+        self.assertEqual(units["mtx"], [])
+        self.assertEqual(pending, [_exit("S")])    # exit pend untouched
+
+    def test_non_margin_reject_still_bails(self):
+        u = _unit(dir_="short")
+        units = {"mtx": [u]}
+        pending = [_exit("S"), _entry(u, "S")]
+        self.assertIsNone(orj.rollback_rejected_entry(
+            pending, units, "MXFF6", "S", "MXFF6", margin_reject=False))
+        self.assertEqual(units["mtx"], [u])
+
+    def test_margin_reject_without_exit_pend_unchanged(self):
+        u = _unit()
+        units = {"mtx": [u]}
+        pending = [_entry(u, "S")]
+        self.assertIs(orj.rollback_rejected_entry(
+            pending, units, "MXFF6", "S", "MXFF6", margin_reject=True), u)
+
+
 class RollbackRejectedExit(unittest.TestCase):
     def test_single_exit_removed_and_returned(self):
         ex = _exit_pe("S")
