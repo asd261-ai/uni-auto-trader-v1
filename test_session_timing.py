@@ -59,3 +59,28 @@ class SessionSummaryActionTest(unittest.TestCase):
         a = st.session_summary_action("break", "night", None, 0.0, 1000.0, DELAY)
         self.assertIsNone(a["fire"])
         self.assertIsNone(a["pending_session"])
+
+
+class WeekendDormantTest(unittest.TestCase):
+    """2026-07-19 audit: `weekday() >= 5` alone treats Sat 00:00–05:00 — the live
+    tail of Friday's night session — as weekend: poll muted (held positions lose
+    exit management) and recon/margin/tick watchdogs dormant while the market
+    trades. Dormancy must require BOTH a weekend calendar day AND no active
+    session (_get_session already knows the Sat-dawn tail is 'night')."""
+
+    def test_sat_dawn_active_night_session_not_dormant(self):
+        self.assertFalse(st.weekend_dormant(5, "night"))
+
+    def test_sat_after_close_dormant(self):
+        self.assertTrue(st.weekend_dormant(5, "break"))
+
+    def test_sunday_dormant(self):
+        self.assertTrue(st.weekend_dormant(6, "break"))
+
+    def test_weekday_break_not_dormant(self):
+        # Weekday lunch break: not weekend — other gates own this window.
+        self.assertFalse(st.weekend_dormant(2, "break"))
+
+    def test_weekday_sessions_not_dormant(self):
+        self.assertFalse(st.weekend_dormant(0, "day"))
+        self.assertFalse(st.weekend_dormant(4, "night"))

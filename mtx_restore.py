@@ -86,12 +86,17 @@ def reconcile_restore(local_units, worker_history, cutoff_ms):
             continue
         uid = u["id"]
         local_ids.add(uid)
-        if uid <= cutoff_ms:
-            dropped_stale.append(uid)
-            continue
         w = by_id.get(uid)
+        # Worker status outranks the cutoff (2026-07-19 audit): a Worker-confirmed
+        # "open" unit is a live broker position even if it was opened before the
+        # current session (carried across the boundary) — dropping it would leave
+        # a real position untracked. The cutoff only drops units the Worker has
+        # NO record of (true ghosts).
         if w is None:
-            to_restore.append(dict(u))                       # conservative: keep local as-is
+            if uid <= cutoff_ms:
+                dropped_stale.append(uid)
+            else:
+                to_restore.append(dict(u))                   # conservative: keep local as-is
         elif w.get("status") == "open":
             merged = dict(u)
             for k in ("stop", "target"):                     # refresh current levels from Worker

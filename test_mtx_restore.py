@@ -97,10 +97,39 @@ class ReconcileRestoreTest(unittest.TestCase):
             self.assertEqual(rec["to_restore"], [], f"{status} should not restore")
             self.assertEqual(len(rec["to_record_exit"]), 1, f"{status} should record exit")
 
-    def test_stale_local_unit_below_cutoff_dropped(self):
+    # ── 2026-07-19 audit: worker status outranks the cutoff ─────────────────
+    # Old semantics dropped any local unit below the session-open cutoff, even
+    # when the Worker still said "open" — a position carried across the session
+    # boundary (e.g. opened 23:00, day-session restart at 10:00) was silently
+    # dropped from tracking while still live at the broker. The cutoff now only
+    # applies to units the Worker has NO record of (true ghosts).
+
+    def test_carried_open_below_cutoff_is_restored(self):
         rec = mr.reconcile_restore(
             local_units=[self._local(id=500)],
-            worker_history=[{"id": 500, "status": "open"}],
+            worker_history=[{"id": 500, "status": "open", "stop": 43600, "target": 43900}],
+            cutoff_ms=self.CUTOFF,
+        )
+        self.assertEqual(len(rec["to_restore"]), 1)      # live position: keep managing it
+        self.assertEqual(rec["to_restore"][0]["stop"], 43600)
+        self.assertEqual(rec["dropped_stale"], [])
+
+    def test_terminal_below_cutoff_records_missed_exit(self):
+        rec = mr.reconcile_restore(
+            local_units=[self._local(id=500)],
+            worker_history=[{"id": 500, "status": "loss", "exit": 43500}],
+            cutoff_ms=self.CUTOFF,
+        )
+        self.assertEqual(rec["to_restore"], [])
+        self.assertEqual(len(rec["to_record_exit"]), 1)  # not silently dropped
+        self.assertEqual(rec["dropped_stale"], [])
+
+    def test_no_worker_record_below_cutoff_still_dropped(self):
+        # True ghost: nothing at the Worker knows this id and it predates the
+        # session — the original stale-drop case, unchanged.
+        rec = mr.reconcile_restore(
+            local_units=[self._local(id=500)],
+            worker_history=[],
             cutoff_ms=self.CUTOFF,
         )
         self.assertEqual(rec["to_restore"], [])

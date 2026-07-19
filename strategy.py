@@ -16,7 +16,7 @@ from mtx_restore import reconcile_restore, load_mtx_state, save_mtx_state, load_
 from settlement_calendar import is_settlement_window
 from market_holidays import is_trading_day
 from margin_headroom import headroom_low, read_failure_alert_due, margin_alert_due
-from session_timing import session_summary_action
+from session_timing import session_summary_action, weekend_dormant
 from exit_reason import stop_hit_reason
 from exit_sanity import sane_exit_price  # defense-in-depth vs Worker exit-price pollution (6/30)
 from atr_gate import should_skip_code4_atr
@@ -352,6 +352,10 @@ class MTXStrategy:
         # producer-side fix in fvg-trader/fvg/live.py (commit aef3946). Disable
         # with env FVG_BOOT_FLOOR=0.
         self._fvg_boot_ts_ms:        int  = int(time.time() * 1000)
+        # MTX equivalent (2026-07-19 audit): only consulted while the MTX cursor is
+        # still None (startup Worker fetch failed) — absorbs pre-boot `open` signals
+        # so the first good poll can't re-enter a position the bot already holds.
+        self._mtx_boot_ts_ms:        int  = int(time.time() * 1000)
         self._proc_start_ts: float = time.time()  # wall-clock boot, for tick-wd kill grace
         self._proc_start_monotonic = time.monotonic()   # monotonic boot anchor for liveness uptime
         self._fvg_boot_floor_enabled: bool = os.getenv("FVG_BOOT_FLOOR", "1") != "0"
@@ -560,6 +564,12 @@ class MTXStrategy:
                                     f"skipped {len(rec['skipped_phantoms'])} phantom")
         except Exception as e:
             logger.warning(f"Startup MTX fetch failed: {e}")
+            # Worker unreachable at boot (2026-07-19 audit): without this, held
+            # positions vanish from tracking (no exit management) AND the None
+            # cursor lets the first good poll re-enter them. Restore what the
+            # bot actually holds from the local state file; the MTX boot floor
+            # covers the duplicate-entry half.
+            self._restore_mtx_local_fallback()
 
         now = datetime.now(TZ_TW)
         self._current_session = _get_session(now)
@@ -736,6 +746,26 @@ class MTXStrategy:
             if self._fill_anchor and pend["source"] == "mtx":
                 fill_emit.send({"source": "mtx", "id": pend["id"], "fill_price": price})
 
+    def _restore_mtx_local_fallback(self):
+        """Startup fallback when the Worker fetch failed: restore held MTX units
+        from mtx_state.json (the bot's own record of what it actually opened) so
+        their stop/target management resumes. Worker-side reconciliation (missed
+        exits, level refresh) is skipped — recon flags any real drift. Never
+        places orders."""
+        try:
+            local_units = load_mtx_state(str(MTX_STATE_PATH))
+            cap = MAX_UNITS_PER_SOURCE["mtx"]
+            for u in (local_units or [])[:cap]:
+                u = self._normalize(u, "mtx")
+                u["label"] = u.get("label") or u.get("sig_label", "")
+                logger.warning(
+                    f"Startup FALLBACK restore (Worker unreachable): MTX "
+                    f"id={u.get('id')} dir={u.get('dir')} — exits managed, "
+                    f"levels NOT refreshed")
+                self._open_unit(u, source="mtx", notify=False, place_order=False)
+        except Exception as e:
+            logger.error(f"Startup local fallback restore failed: {e}")
+
     def _flush_due_exit_records(self):
         """Task B safety net: flush deferred trade records whose real exit fill never
         arrived within EXIT_FILL_TIMEOUT_MS → write with exit_fill=null + warn. Worst
@@ -747,6 +777,11 @@ class MTXStrategy:
                 return
             for pe in due:
                 self._pending_exit_records.remove(pe)
+                # Also drop the exit pend that carries this pe (2026-07-19 audit):
+                # leaving it in _pending_fills mis-attributes every later fill and
+                # keeps _position_is_flat False forever.
+                self._pending_fills = [p for p in self._pending_fills
+                                       if p.get("pe") is not pe]
                 rec = real_fill_pnl.finalize_exit(pe["record"], None, pe["record"]["dir_"])
                 self._record_trade(**rec)
                 logger.warning(
@@ -790,6 +825,12 @@ class MTXStrategy:
                 f"[order-rejected] source={unit['source']} dir={unit['dir']} "
                 f"id={unit['id']} status={orderstatus} → unit rolled back (no fill, no P&L)"
             )
+            # Persist the rollback (2026-07-19 audit): memory-only removal means a
+            # restart re-reads the state file and resurrects the phantom unit.
+            if unit.get("source") == "fvg":
+                self._save_fvg_state()
+            else:
+                self._save_mtx_state()
         elif booked_exit is not None:
             logger.warning(
                 f"[order-rejected] EXIT rejected status={orderstatus} "
@@ -825,10 +866,13 @@ class MTXStrategy:
 
     def _poll_loop(self):
         while self._running:
-            # Weekend filter: market closed Sat/Sun → broker unreachable, any trading
-            # logic is wasted at best, ghost-record-polluting at worst. Skip core trading
-            # paths but keep heartbeat + recon running (so watchdog stays happy).
-            is_weekend = datetime.now(TZ_TW).weekday() >= 5
+            # Weekend filter: dead weekend → broker unreachable, any trading logic is
+            # wasted at best, ghost-record-polluting at worst. Skip core trading paths
+            # but keep heartbeat + recon running (so watchdog stays happy).
+            # Session-aware (2026-07-19 audit): Sat 00:00–05:00 is the live tail of
+            # Friday's night session — a bare weekday()>=5 muted it, leaving held
+            # positions without exit management.
+            is_weekend = weekend_dormant(datetime.now(TZ_TW).weekday(), self._current_session)
             try:
                 self._check_session_change()
                 self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
@@ -883,7 +927,7 @@ class MTXStrategy:
             try:
                 self._tick_wd.check(
                     time.time(), self._current_session,
-                    datetime.now(TZ_TW).weekday() >= 5,
+                    weekend_dormant(datetime.now(TZ_TW).weekday(), self._current_session),
                     lambda m: logger.warning(f"[tick-wd OBSERVE] {m}"),  # PHASE 2: -> self._safe_health_notify
                     uptime=time.time() - self._proc_start_ts,
                     on_kill=self._tick_wd_kill,
@@ -1306,10 +1350,11 @@ class MTXStrategy:
         skip so when session resumes the tolerance window picks up where it
         left off — but stale state can self-reset on first match after resume.
         """
-        # Don't bother during break / unknown sessions or weekends
+        # Don't bother during break / unknown sessions. The session gate already
+        # encodes weekends/holidays (_get_session → is_trading_day), and it knows
+        # Sat 00:00–05:00 is an ACTIVE night session — the old extra weekday()>=5
+        # check wrongly slept through it (2026-07-19 audit).
         if self._current_session not in ("day", "night"):
-            return
-        if datetime.now(TZ_TW).weekday() >= 5:  # 5=Saturday, 6=Sunday
             return
 
         now = time.time()
@@ -1422,9 +1467,9 @@ class MTXStrategy:
         """
         if MARGIN_HEADROOM_MIN_TWD <= 0:   # feature disabled
             return
+        # Session gate covers weekends/holidays and keeps the Sat-dawn night tail
+        # active (2026-07-19 audit — same fix as the recon gate above).
         if self._current_session not in ("day", "night"):
-            return
-        if datetime.now(TZ_TW).weekday() >= 5:  # 5=Sat, 6=Sun
             return
         now = time.time()
         if now - self._margin_last_check < RECON_CHECK_INTERVAL_SEC:
@@ -1686,6 +1731,20 @@ class MTXStrategy:
             # signals replayed at boot. Without this, restart re-fires any FVG
             # signal the producer never closed (e.g. producer-crash leftovers),
             # causing phantom Unit 1 in trader state.
+            # MTX boot floor (2026-07-19 audit): if the startup fetch failed the
+            # cursor is still None (cutoff 0) and the bot's own held position is a
+            # `status=open` record with id > 0 — without this, the first good poll
+            # re-enters it with a REAL duplicate order. Only active while the
+            # cursor is uninitialized; normal boots set it and never come here.
+            if source == "mtx" and self._last_seen_id.get("mtx") is None \
+                    and trade_id <= self._mtx_boot_ts_ms:
+                logger.info(
+                    f"MTX pre-boot signal {trade_id} silent-absorbed "
+                    f"(cursor uninitialized, boot_ts={self._mtx_boot_ts_ms})"
+                )
+                self._last_seen_id[source] = trade_id
+                continue
+
             if source == "fvg" and self._fvg_boot_floor_enabled and trade_id <= self._fvg_boot_ts_ms:
                 logger.info(
                     f"FVG pre-boot signal {trade_id} silent-absorbed "
