@@ -185,9 +185,23 @@ def _read_matches(base: str):
 
 
 def _fifo(fills):
+    """fills: [(ts, bs, price)] plus optional flat markers (ts, "FLAT", None).
+
+    A flat marker is the bot's own "truly flat here" checkpoint (P4-1,
+    2026-07-20 design): any legs still open at the marker are DATA HOLES
+    (e.g. an entry whose match event was lost to a disconnect — the orphan-
+    close poisoning class) — discard them so they can't mis-pair with later
+    fills. Discarded legs count nothing: same conservative direction as the
+    missing-fill exclusion and the min() backstop."""
     pos = []      # open legs: (side 'L'/'S', entry_price)
     closed = []   # round-trips: (close_ts_iso, pnl_pts)
+    dropped = 0
     for ts, bs, price in fills:
+        if bs == "FLAT":
+            if pos:
+                dropped += len(pos)
+                pos = []
+            continue
         side = "L" if bs == "B" else "S"
         if pos and pos[0][0] != side:
             oside, oprice = pos.pop(0)
@@ -195,7 +209,7 @@ def _fifo(fills):
             closed.append((ts, pnl))
         else:
             pos.append((side, price))
-    return closed, pos
+    return closed, pos, dropped
 
 
 # How far before the window start the FIFO scan may reach to find the open leg of a
@@ -223,11 +237,15 @@ def realized_day_pts(rows, start, end):
     scan_start = start - timedelta(days=_CARRY_LOOKBACK_DAYS)
     bot = bot_ordernos(rows)
     by_pid = {}
+    flats = []   # flat checkpoints (P4-1): account-level, applied to every pid stream
     for r in rows:
-        if r.get("event") != "match" or r.get("orderno") not in bot:
-            continue
         ts = _parse_iso(r.get("ts"))
         if ts is None or not (scan_start <= ts < end):
+            continue
+        if r.get("event") == "flat":
+            flats.append(ts)
+            continue
+        if r.get("event") != "match" or r.get("orderno") not in bot:
             continue
         bs = r.get("bs")
         price = r.get("matchprice")
@@ -238,9 +256,15 @@ def realized_day_pts(rows, start, end):
             by_pid.setdefault(r.get("productid"), []).append((ts, bs, float(price)))
     total = 0.0
     trips = 0
-    for fills in by_pid.values():
-        fills.sort(key=lambda x: x[0])
-        closed, _open = _fifo(fills)
+    for pid, fills in by_pid.items():
+        fills.extend((fts, "FLAT", None) for fts in flats)
+        # Same-second tie-break: the flat transition is detected AFTER the
+        # closing fill, so markers sort behind fills sharing their timestamp.
+        fills.sort(key=lambda x: (x[0], x[1] == "FLAT"))
+        closed, _open, dropped = _fifo(fills)
+        if dropped:
+            _log.warning(f"PNL_FIFO_RESET: flat checkpoint dropped {dropped} unmatched "
+                         f"leg(s) for {pid} — data hole absorbed, nothing counted")
         for close_ts, pnl in closed:
             if start <= close_ts < end:
                 total += pnl

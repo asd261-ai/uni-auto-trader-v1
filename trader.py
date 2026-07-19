@@ -6,6 +6,7 @@ import order_log
 import order_guard  # process-level live-order gate (BOARD T010, 7/10 near-miss class fix)
 from feed_schema import parse_broker_position, parse_fill, SCHEMA_FAIL
 from order_reject import is_reject_status
+from orderno_claim import OrdernoClaimer
 from sdk_timeout import call_with_timeout, SDKCallTimeout
 
 SDK_READ_TIMEOUT_SEC = float(os.getenv("SDK_READ_TIMEOUT_SEC", "5"))
@@ -27,6 +28,13 @@ class AutoTrader:
         self._connected = False  # 首次連線後才為 True，用於區分首次 vs 重連
         self.strategy = None  # 由外部注入 MTXStrategy
         self._last_resub_ts = 0.0  # last dquote resubscribe attempt (min-interval guard)
+        # P4-2 (2026-07-20 design): sent→reply orderno claiming distinguishes the
+        # bot's own fills/rejects from Sean's manual same-product events on the
+        # shared account. Modes: off = legacy | observe (default) = log
+        # would-skip only | on = actually filter foreign events. Arm ladder:
+        # observe ≥1 week zero false-foreign, then ask-first.
+        self._orderno_filter_mode = os.getenv("FILL_ORDERNO_FILTER", "observe").strip().lower()
+        self._claimer = OrdernoClaimer()
 
     # ── 啟動 / 停止 ──────────────────────────────────────────────
 
@@ -187,7 +195,17 @@ class AutoTrader:
         logger.info(f"Reply | {reply.productid} {reply.bs} status={reply.orderstatus} orderno={reply.orderno}")
         order_log.log_event("reply", productid=reply.productid, bs=reply.bs,
                             orderno=reply.orderno, orderstatus=reply.orderstatus)
+        # P4-2: claim the orderno against our outstanding sents (mirrors offline
+        # bot_ordernos). Unclaimed = foreign (Sean's manual order on the shared
+        # account) — in `on` mode its reject must not trigger our rollback.
+        is_ours = self._claimer.note_reply(time.time(), reply.productid, reply.bs, reply.orderno)
         if self.strategy and is_reject_status(reply.orderstatus):
+            if not is_ours and self._orderno_filter_mode in ("observe", "on"):
+                logger.warning(f"[orderno-filter {self._orderno_filter_mode.upper()}] "
+                               f"foreign reject orderno={reply.orderno} "
+                               f"{'SKIPPED' if self._orderno_filter_mode == 'on' else 'would-skip (still routed)'}")
+                if self._orderno_filter_mode == "on":
+                    return
             try:
                 self.strategy.on_order_rejected(reply.productid, reply.bs, reply.orderstatus)
             except Exception as e:
@@ -209,6 +227,16 @@ class AutoTrader:
         logger.info(f"Match | {match.productid} {bs} price={price} qty={qty} orderno={match.orderno}")
         order_log.log_event("match", productid=match.productid, bs=bs,
                             orderno=match.orderno, matchprice=price, matchqty=qty)
+        # P4-2: a fill whose orderno was never claimed is a manual/foreign fill.
+        # In `on` mode keep it away from on_fill's FIFO attribution (orders.jsonl
+        # above still records it — pnl_calc provenance handles the ledger side).
+        if not self._claimer.is_bot_fill(match.orderno) and \
+                self._orderno_filter_mode in ("observe", "on"):
+            logger.warning(f"[orderno-filter {self._orderno_filter_mode.upper()}] "
+                           f"foreign fill orderno={match.orderno} price={price} "
+                           f"{'SKIPPED' if self._orderno_filter_mode == 'on' else 'would-skip (still attributed)'}")
+            if self._orderno_filter_mode == "on":
+                return
         # Fill-anchoring (Plan B): let the strategy attribute this fill to a pending
         # entry/exit and (if FILL_ANCHOR) report the real entry price to the Worker.
         if self.strategy:
@@ -376,4 +404,7 @@ class AutoTrader:
         resp = self.api.dtrade.order(order)
         if not resp.issend:
             logger.error(f"Order failed: {resp.errormsg}")
+        else:
+            # P4-2: register for orderno claiming (mirrors the 'sent' event above).
+            self._claimer.note_sent(time.time(), productid, bs)
         return resp

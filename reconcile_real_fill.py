@@ -166,7 +166,7 @@ def fifo_for_day(base: str, start_iso: str, end_iso: str) -> Tuple[float, int]:
     total = 0.0
     n = 0
     for pid in sorted(by_pid):
-        closed, _open = pnl_calc._fifo(by_pid[pid])
+        closed, _open, _dropped = pnl_calc._fifo(by_pid[pid])
         for ts, pnl in closed:
             if start_iso <= ts < end_iso:
                 total += pnl

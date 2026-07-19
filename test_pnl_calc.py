@@ -292,6 +292,70 @@ class RealizedDayPtsCarryTest(unittest.TestCase):
         self.assertEqual(trips, 0)
 
 
+class FlatCheckpointFifoTest(unittest.TestCase):
+    """P4-1 (2026-07-19 audit → 2026-07-20 design): an orphan close leg (its
+    open's match event lost to a disconnect) used to be mis-read as an open leg
+    and poison FIFO pairing for up to 5 lookback days. A `flat` event in
+    orders.jsonl marks 'bot truly flat here' — the FIFO drops any unmatched
+    legs at the marker (data hole absorbed, nothing counted for them)."""
+
+    START = datetime(2026, 7, 17, 8, 45, tzinfo=timezone(timedelta(hours=8)))
+    END   = datetime(2026, 7, 17, 13, 45, tzinfo=timezone(timedelta(hours=8)))
+
+    def _sent_reply_match(self, ts_iso, bs, price, ono):
+        return [
+            {"event": "sent",  "ts": ts_iso, "productid": "MXFH6", "bs": bs},
+            {"event": "reply", "ts": ts_iso, "productid": "MXFH6", "bs": bs, "orderno": ono},
+            {"event": "match", "ts": ts_iso, "productid": "MXFH6", "bs": bs,
+             "orderno": ono, "matchprice": price, "matchqty": 1},
+        ]
+
+    def test_orphan_close_before_checkpoint_absorbed(self):
+        # Day-1: orphan S (its B open's match was lost). Then a flat checkpoint.
+        # Day-2 window: clean B→S round trip must pay exactly its own pnl.
+        rows = []
+        rows += self._sent_reply_match("2026-07-16T10:00:00+08:00", "S", 44700, "A1")  # orphan close
+        rows.append({"event": "flat", "ts": "2026-07-16T10:00:05+08:00"})
+        rows += self._sent_reply_match("2026-07-17T09:00:00+08:00", "B", 44500, "B1")
+        rows += self._sent_reply_match("2026-07-17T10:00:00+08:00", "S", 44600, "B2")
+        pts, trips = realized_day_pts(rows, self.START, self.END)
+        self.assertEqual(pts, 100.0)   # NOT 44700-44500=200 (orphan mis-pair)
+        self.assertEqual(trips, 1)
+
+    def test_no_checkpoint_keeps_legacy_behavior(self):
+        # Without a marker the orphan still mis-pairs — documents that the fix
+        # requires checkpoints (old files unchanged, no silent history rewrite).
+        rows = []
+        rows += self._sent_reply_match("2026-07-16T10:00:00+08:00", "S", 44700, "A1")
+        rows += self._sent_reply_match("2026-07-17T09:00:00+08:00", "B", 44500, "B1")
+        rows += self._sent_reply_match("2026-07-17T10:00:00+08:00", "S", 44600, "B2")
+        pts, trips = realized_day_pts(rows, self.START, self.END)
+        self.assertEqual(trips, 1)     # legacy poison: orphan S pairs with B1 → bogus +200, B2 dangles
+        self.assertEqual(pts, 200.0)
+
+    def test_checkpoint_with_clean_pairs_is_noop(self):
+        rows = []
+        rows += self._sent_reply_match("2026-07-17T09:00:00+08:00", "B", 44500, "C1")
+        rows += self._sent_reply_match("2026-07-17T09:30:00+08:00", "S", 44550, "C2")
+        rows.append({"event": "flat", "ts": "2026-07-17T09:30:05+08:00"})
+        rows += self._sent_reply_match("2026-07-17T10:00:00+08:00", "B", 44600, "C3")
+        rows += self._sent_reply_match("2026-07-17T11:00:00+08:00", "S", 44680, "C4")
+        pts, trips = realized_day_pts(rows, self.START, self.END)
+        self.assertEqual(pts, 130.0)   # 50 + 80, marker between complete pairs = no-op
+        self.assertEqual(trips, 2)
+
+    def test_same_second_marker_sorts_after_fill(self):
+        # The flat transition is detected AFTER the closing fill; a same-second
+        # marker must not split the pair it follows.
+        rows = []
+        rows += self._sent_reply_match("2026-07-17T09:00:00+08:00", "B", 44500, "D1")
+        rows += self._sent_reply_match("2026-07-17T09:30:00+08:00", "S", 44550, "D2")
+        rows.append({"event": "flat", "ts": "2026-07-17T09:30:00+08:00"})  # same second
+        pts, trips = realized_day_pts(rows, self.START, self.END)
+        self.assertEqual(pts, 50.0)
+        self.assertEqual(trips, 1)
+
+
 from pnl_calc import divergence_warn
 
 

@@ -30,6 +30,7 @@ from pollloop_watchdog import PollLoopLivenessWatchdog
 from fd_watchdog import FdLeakWatchdog
 from dquote_resub import DquoteResubPolicy
 from disconnect_watchdog import DisconnectStormWatchdog
+import order_log      # P4-1: flat checkpoints into orders.jsonl
 import order_reject
 import real_fill_pnl  # task B: real-fill P&L fields for trades.jsonl
 
@@ -780,6 +781,21 @@ class MTXStrategy:
         except Exception as e:
             logger.error(f"Startup local fallback restore failed: {e}")
 
+    def _log_flat_transition(self):
+        """P4-1 (2026-07-20 design): write ONE `flat` event to orders.jsonl each
+        time the bot transitions to flat (and once at boot if it boots flat).
+        These checkpoints let pnl_calc's FIFO drop orphan legs (lost match
+        events) at the next flat point instead of letting them poison pairing
+        for up to 5 lookback days. Called once per poll cycle."""
+        try:
+            flat_now = self._position_is_flat()
+            if flat_now and not getattr(self, "_was_flat", False):
+                order_log.log_event("flat")
+                logger.info("flat checkpoint written (position transitioned to flat)")
+            self._was_flat = flat_now
+        except Exception as e:
+            logger.debug(f"flat-transition log error (silent): {e}")
+
     def _flush_due_exit_records(self):
         """Task B safety net: flush deferred trade records whose real exit fill never
         arrived within EXIT_FILL_TIMEOUT_MS → write with exit_fill=null + warn. Worst
@@ -893,6 +909,7 @@ class MTXStrategy:
                 self._check_trading_day_reset()   # Phase 7: reset daily P&L counter at 08:45 TW
                 self._check_daily_loss_lock()     # Phase 7: daily MAX LOSS lock from REAL P&L (restart-safe)
                 self._flush_due_exit_records()    # task B: flush deferred records past 60s timeout
+                self._log_flat_transition()       # P4-1: flat checkpoint into orders.jsonl
                 if not is_weekend:
                     for src_info in SIGNAL_SOURCES:
                         source = src_info["source"]
